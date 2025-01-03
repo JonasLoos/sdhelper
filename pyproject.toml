@@ -1,0 +1,33 @@
+[project]
+name = "sdhelper"
+authors = [
+    {name = "Jonas Loos", email = "sdhelper@jloos.de"}
+]
+description = "A helper package for working with stable diffusion models."
+readme = "README.md"
+license = {file = "LICENSE"}
+dynamic = ["version"]
+requires-python = ">=3.9"
+dependencies = [
+    "diffusers",
+    "transformers",
+    "torch",
+    "datasets",
+    "accelerate",
+    "protobuf",
+    "sentencepiece",
+]
+
+[project.urls]
+Homepage = "https://github.com/JonasLoos/sdhelper"
+
+[build-system]
+requires = [
+    "setuptools>=61",
+    "setuptools-scm>=8.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+write_to = "sdhelper/_version.py"
