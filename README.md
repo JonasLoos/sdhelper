@@ -1,3 +1,6 @@
+[![PyPI](https://img.shields.io/pypi/v/sdhelper?logo=pypi)](https://pypi.org/project/sdhelper/)
+[![Downloads](https://img.shields.io/pypi/dm/sdhelper)](https://pypi.org/project/sdhelper/)
+
 # Stable Diffusion Helper
 
 A helper package for working with stable diffusion models. Allows for easy extraction of U-Net (and transformer) representations.
