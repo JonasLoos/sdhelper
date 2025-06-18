@@ -8,7 +8,7 @@ from typing import Optional, Callable, Any, overload
 from PIL.Image import Image as PILImage
 import PIL.Image
 from dataclasses import dataclass
-from tqdm.autonotebook import tqdm, trange
+from tqdm.autonotebook import trange
 import re
 
 
@@ -85,10 +85,10 @@ class SDRepresentation():
 
     def __getitem__(self, key):
         return self.data[key]
-    
+
     def __repr__(self):
         return 'SDRepresentation({' + ', '.join(f'"{k}": ...' for k in self.pos) + '})'
-    
+
     def apply(self, fn: Callable, *args, **kwargs):
         '''Apply a function to all representations.'''
         return SDRepresentation({k: [fn(v, *args, **kwargs) for v in vs] for k, vs in self.data.items()})
@@ -345,7 +345,7 @@ class SD:
                 def helper(t): return tuple(helper(t_) for t_ in t) if isinstance(t, tuple) else tuple(t.shape)
                 self._representation_shapes = {k: helper(v[0]) for k,v in result.representations.data.items()}, tuple(result.result_tensor.shape)
         return self._representation_shapes
-    
+
     def quantize(self, quantization_modules: list[str] | None = None, quantization_type: str = 'qfloat8', model_cpu_offload: bool = False, sequential_cpu_offload: bool = False):
         '''Optimize VRAM usage of the model.
 
@@ -450,7 +450,7 @@ class SD:
                             return modification(module, input, output, extract_position)
                     # eval is unsafe. Do not use in production.
                     stack.enter_context(eval(f'unet.{extract_position}', {'__builtins__': {}, 'unet': self.pipeline.unet}).register_forward_hook(partial(get_repr, extract_position=extract_position)))
-                
+
                 # run pipeline
                 result = self.pipeline(
                     prompt,
@@ -623,7 +623,7 @@ class SD:
                 pipe.unet(latents, timestep, encoder_hidden_states=prompt_embeds)
 
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
-        
+
     @overload
     def img2repr(self, data: PILImage | np.ndarray | str, extract_positions: list[str], step: int, resize: int | None = None, prompt: str = '', spatial_avg: bool = False, output_device: str = 'cpu', batch_size: int = 1, seed: Optional[int] = None) -> SDRepresentation: ...
 
