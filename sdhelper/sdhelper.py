@@ -13,7 +13,6 @@ import re
 
 
 
-
 def load_sdxl_lightning(config: dict, device: str, dtype: torch.dtype, local_files_only: bool):
     '''Load SDXL-Lightning model with specified number of steps.'''
     # SDXL-Lightning needs custom loading because it's designed replace only the unet of SDXL
@@ -250,6 +249,21 @@ class SD:
             'steps': 28,
             'guidance_scale': 7.0,
         },
+        'SD3.5-Large': {
+            'name': 'stabilityai/stable-diffusion-3.5-large',
+            'steps': 28,
+            'guidance_scale': 3.5,
+        },
+        'SD3.5-Medium': {
+            'name': 'stabilityai/stable-diffusion-3.5-medium',
+            'steps': 28,
+            'guidance_scale': 3.5,
+        },
+        'SD3.5-Large-Turbo': {
+            'name': 'stabilityai/stable-diffusion-3.5-large-turbo',
+            'steps': 4,
+            'guidance_scale': 1.0,
+        },
         'FLUX-dev': {
             'name': 'black-forest-labs/FLUX.1-dev',
             'steps': 28,
@@ -279,7 +293,11 @@ class SD:
             local_files_only: Prevent downloading of the model weights.
         '''
         # fuzzy match model name to known models (e.g. 'sd15' -> 'SD1.5')
-        self.model_name = {re.sub(r'\s|\.|-|_','',k).lower(): k for k in self.known_models.keys()}.get(re.sub(r'\s|\.|-|_','',model_name).lower(), model_name)
+        def simplified_model_name(name: str) -> str:
+            return re.sub(r'\s|\.|-|_', '', name).lower()
+        self.model_name = {simplified_model_name(k): k for k in self.known_models.keys()}.get(simplified_model_name(model_name), model_name)
+        if self.model_name not in self.known_models:
+            print(f"Model `{model_name}` not found in known models, assuming it's a custom model.")
 
         # setup model config
         self.config = self.known_models.get(self.model_name, {'name': self.model_name}) if config is None else config
@@ -296,13 +314,7 @@ class SD:
         if 'load_fn' in self.config:
             self.pipeline = self.config['load_fn'](config=self.config, device=self.device, dtype=self.dtype, local_files_only=local_files_only)
         else:
-            try:
-                self.pipeline = AutoPipelineForText2Image.from_pretrained(self.config['name'], torch_dtype=torch.float16, local_files_only=local_files_only).to(self.device, dtype=self.dtype)
-            except OSError as e:
-                if 'is not a local folder and is not a valid model identifier' in str(e):
-                    raise ValueError(f"Model `{self.config['name']}` isn't a known model and can also not be found on huggingface. Known models: \n" + '\n'.join(self.known_models.keys()))
-                else:
-                    raise e
+            self.pipeline = AutoPipelineForText2Image.from_pretrained(self.config['name'], torch_dtype=torch.float16, local_files_only=local_files_only).to(self.device, dtype=self.dtype)
         # restore progress bar status
         if progressbar_enabled and disable_progress_bar: diffusers.utils.logging.enable_progress_bar()
 
@@ -336,7 +348,7 @@ class SD:
         '''Return the shape of the representations at each extract position.'''
         if self._representation_shapes is None:
             if self.model_name not in self.known_models: raise ValueError(f'Cannot determine representation shapes for unknown model {self.model_name}.')
-            if self.model_name in ['SD3', 'FLUX-dev', 'FLUX-schnell']:
+            if self.model_name in ['SD3', 'SD3.5-Large', 'SD3.5-Large-Turbo', 'FLUX-dev', 'FLUX-schnell']:
                 fake_img = PIL.Image.new('RGB', (1024, 1024))
                 reprs = self.img2repr(fake_img, extract_positions=self.available_extract_positions, step=1)
                 self._representation_shapes = {k: tuple(v.shape) for k, v in reprs.data.items()}, (3, 1024, 1024)
@@ -409,7 +421,7 @@ class SD:
         # random seed if not specified
         seed = seed if seed != None else int(torch.randint(0, 2**32, (1,)).item())
 
-        if self.model_name in ['SD3', 'FLUX-dev', 'FLUX-schnell']:
+        if self.model_name in ['SD3', 'SD3.5-Large', 'SD3.5-Large-Turbo', 'FLUX-dev', 'FLUX-schnell']:
             if preserve_grad or modification is not None or len(extract_positions) > 0:
                 raise ValueError(f'{self.model_name} support for gradient preservation, modifications, or extract positions is not implemented yet.')
             result_images = self.pipeline(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height)
@@ -488,7 +500,7 @@ class SD:
         '''
         vae = self.pipeline.vae
         vae_dtype = next(vae.modules()).dtype
-        if self.model_name in ['SD3', 'FLUX-dev', 'FLUX-schnell']:
+        if self.model_name in ['SD3', 'SD3.5-Large', 'SD3.5-Large-Turbo', 'FLUX-dev', 'FLUX-schnell']:
             img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
             return (vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) - vae.config.shift_factor) * vae.config.scaling_factor
         else:
@@ -503,7 +515,7 @@ class SD:
             latents: The latents to decode.
         '''
         pipe = self.pipeline
-        if self.model_name in ['SD3', 'FLUX-dev', 'FLUX-schnell']:
+        if self.model_name in ['SD3', 'SD3.5-Large', 'SD3.5-Medium', 'SD3.5-Large-Turbo', 'FLUX-dev', 'FLUX-schnell']:
             tmp = pipe.vae.decode((latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor, return_dict=False)
             return pipe.image_processor.postprocess(tmp)  # type: ignore
         else:
@@ -548,7 +560,7 @@ class SD:
 
         # TODO: maybe cache prompt_embeds (difficulty is that encode_prompt is different over models)
 
-        if self.model_name == 'SD3':
+        if 'SD3' in self.model_name:
             pipe.scheduler.set_timesteps(1000, device=self.device)
             timestep = pipe.scheduler.timesteps[999 - step]
             prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(prompt=prompts, prompt_2=None, prompt_3=None)  # type: ignore
@@ -566,7 +578,8 @@ class SD:
             num_tokens = next(iter(representations.values())).shape[1]
             potential_repr_shapes = [(i, num_tokens//i) for i in range(1, num_tokens) if num_tokens % i == 0]
             repr_shape = min(potential_repr_shapes, key=lambda x: abs(x[1]/x[0] - width / height))
-            representations = {p: r.reshape(batch_size, *repr_shape, 1536).permute(0, 3, 1, 2) for p, r in representations.items()}
+            latent_dim = 2432 if '3.5' in self.model_name else 1536
+            representations = {p: r.reshape(batch_size, *repr_shape, latent_dim).permute(0, 3, 1, 2) for p, r in representations.items()}
 
         elif 'FLUX' in self.model_name:
             # timestep
