@@ -39,7 +39,7 @@ class SD:
                     available_models.append(obj.name)
         raise ValueError(f"Model `{name}` not found. Available models: {available_models}")
 
-    def __init__(self, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
+    def __init__(self, name: str = '', device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
         self.local_files_only = local_files_only
 
         # determine device and dtype
