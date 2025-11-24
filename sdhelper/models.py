@@ -617,3 +617,81 @@ class FLUX_schnell(FLUX_base):
     full_name = 'black-forest-labs/FLUX.1-schnell'
     steps = 4
     guidance_scale = 0.0
+
+
+class Playground_V2_5(SD_unet):
+    """
+    Playground v2.5 1024px aesthetic checkpoint.
+
+    SDXL-style UNet + VAE, so we can reuse SD_unet's encode/decode/img2repr
+    path exactly like SDXL.
+    """
+    name = "Playground-v2.5"
+    full_name = "playgroundai/playground-v2.5-1024px-aesthetic"
+    steps = 50
+    guidance_scale = 3.0
+
+    def _load_pipeline(self):
+        from diffusers import StableDiffusionXLPipeline
+
+        kwargs = {
+            "torch_dtype": self.dtype,
+            "local_files_only": self.local_files_only,
+        }
+        # Playground publishes an fp16 variant; only request it when relevant
+        if self.dtype == torch.float16:
+            kwargs["variant"] = "fp16"
+
+        self.pipeline = StableDiffusionXLPipeline.from_pretrained(
+            self.full_name,
+            **kwargs,
+        ).to(self.device)
+
+
+class AuraFlow(SD_transformer):
+    """AuraFlow v0.3 is a large rectified flow T2I model with a dedicated AuraFlowPipeline."""
+    name = "AuraFlow"
+    full_name = "fal/AuraFlow-v0.3"
+    steps = 50
+    guidance_scale = 3.5
+
+    def _load_pipeline(self):
+        from diffusers import AuraFlowPipeline
+
+        kwargs = {
+            "torch_dtype": self.dtype,
+            "local_files_only": self.local_files_only,
+        }
+        if self.dtype == torch.float16:
+            kwargs["variant"] = "fp16"
+
+        self.pipeline = AuraFlowPipeline.from_pretrained(
+            self.full_name,
+            **kwargs,
+        ).to(self.device)
+
+    def _img2repr(self, *args, **kwargs) -> list[SDRepresentation]:
+        raise NotImplementedError("img2repr is not implemented for AuraFlow yet. You can still use AuraFlow for text-to-image generation.")
+
+
+class Kandinsky3(SD_base):
+    """Kandinsky-3 is a U-Net based latent diffusion model with a Flan-UL2 text encoder and a MoVQ encoder/decoder."""
+    name = "Kandinsky-3"
+    full_name = "kandinsky-community/kandinsky-3"
+    steps = 25
+    guidance_scale = 4.0
+    def _load_pipeline(self):
+        kwargs = {
+            "torch_dtype": self.dtype,
+            "local_files_only": self.local_files_only,
+        }
+        if self.dtype == torch.float16:
+            kwargs["variant"] = "fp16"
+
+        self.pipeline = AutoPipelineForText2Image.from_pretrained(
+            self.full_name,
+            **kwargs,
+        ).to(self.device)
+
+    def _img2repr(self, *args, **kwargs) -> list[SDRepresentation]:
+        raise NotImplementedError("img2repr is not implemented for Kandinsky-3 yet. You can still use Kandinsky-3 for text-to-image generation.")
