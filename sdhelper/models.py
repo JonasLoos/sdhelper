@@ -14,6 +14,21 @@ from abc import ABC, abstractmethod
 from .data import SDRepresentation, SDResult
 
 
+def get_module_by_path(model: Any, path: str) -> Any:
+    """Safely navigate to a module using a path string."""
+    current = model
+    for name, index in re.findall(r'(\w+)(?:\[(\d+)\])?', path):
+        try:
+            current = getattr(current, name)
+            if index:
+                current = current[int(index)]
+        except AttributeError:
+            raise AttributeError(f"Extract position `{path}` not found`: Attribute `{name}` not available.")
+        except IndexError:
+            raise IndexError(f"Extract position `{path}` not found`: Index `{index}` out of range.")
+    return current
+
+
 class SD:
     name: str
     full_name: str
@@ -230,8 +245,7 @@ class SD_unet(SD_base, ABC):
                     representations[extract_position].append(output)
                     if modification:
                         return modification(module, input, output, extract_position)
-                # eval is unsafe. Do not use in production.
-                stack.enter_context(eval(f'unet.{extract_position}', {'__builtins__': {}, 'unet': self.pipeline.unet}).register_forward_hook(partial(get_repr, extract_position=extract_position)))
+                stack.enter_context(get_module_by_path(self.pipeline.unet, extract_position).register_forward_hook(partial(get_repr, extract_position=extract_position)))
 
             # run pipeline
             result = self.pipeline(
@@ -299,8 +313,7 @@ class SD_unet(SD_base, ABC):
                     if spatial_avg:
                         output = output.mean(dim=(2, 3))
                     representations[extract_position] = output.to(output_device)
-                # eval is unsafe. Do not use in production.
-                stack.enter_context(eval(f'model.{extract_position}', {'__builtins__': {}, 'model': pipe.unet}).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+                stack.enter_context(get_module_by_path(pipe.unet, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
             pipe.unet(latents, timestep, encoder_hidden_states=prompt_embeds)
 
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
@@ -502,7 +515,7 @@ class SD3_base(SD_transformer, ABC):
             for extract_position in extract_positions:
                 def hook_fn(module, input, output, extract_position):
                         representations[extract_position] = output[1].to(output_device)
-                stack.enter_context(eval(f'model.{extract_position}', {'__builtins__': {}, 'model': pipe.transformer}).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+                stack.enter_context(get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(device=self.device), encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds)
 
         # fix representation shape
@@ -580,7 +593,7 @@ class FLUX_base(SD_transformer, ABC):
             for extract_position in extract_positions:
                 def hook_fn(module, input, output, extract_position):
                     representations[extract_position] = output[1].to(output_device)
-                stack.enter_context(eval(f'model.{extract_position}', {'__builtins__': {}, 'model': pipe.transformer}).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+                stack.enter_context(get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000, guidance=None, encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds, txt_ids=text_ids, img_ids=latent_image_ids)
 
         # fix representation shape
