@@ -618,11 +618,9 @@ class FLUX_schnell(FLUX_base):
     steps = 4
     guidance_scale = 0.0
 
+
 class FLUX_Krea(FLUX_base):
-    """
-    FLUX.1 Krea [dev] is a FLUX variant tuned for strong aesthetics and photorealism.
-    It works as a drop-in text-to-image replacement for FLUX.1-dev and uses the same FluxPipeline architecture, so FLUX_base's img2repr implementation continues to work.
-    """
+    """FLUX.1 Krea [dev] is a FLUX [dev] variant tuned for strong aesthetics and photorealism. It works as a drop-in text-to-image replacement for FLUX.1-dev and uses the same FluxPipeline architecture, so FLUX_base's img2repr implementation continues to work."""
     name = "FLUX-Krea"
     full_name = "black-forest-labs/FLUX.1-Krea-dev"
     steps = 30
@@ -648,7 +646,6 @@ class Playground_V2_5(SD_unet):
             "torch_dtype": self.dtype,
             "local_files_only": self.local_files_only,
         }
-        # Playground publishes an fp16 variant; only request it when relevant
         if self.dtype == torch.float16:
             kwargs["variant"] = "fp16"
 
