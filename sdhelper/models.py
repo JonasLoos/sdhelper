@@ -204,7 +204,7 @@ class SD_unet(SD_base, ABC):
     @property
     def ddim_scheduler(self):
         if self._ddim_scheduler is None:
-            self._ddim_scheduler = DDIMScheduler.from_pretrained(self.config['name'], subfolder='scheduler')
+            self._ddim_scheduler = DDIMScheduler.from_pretrained(self.full_name, subfolder='scheduler')
         return self._ddim_scheduler
 
     def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification: Optional[Callable[[Any,Any,Any,str],Optional[torch.Tensor]]] = None, extract_positions: list[str] = []) -> 'SDResult':
@@ -548,7 +548,7 @@ class SD3_5_Large_Turbo(SD3_base):
 
 class FLUX_base(SD_transformer, ABC):
     """Base class for FLUX models."""
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, resize: int | None, prompt: str, spatial_avg: bool, output_device: str, seed: Optional[int] = None) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, resize: int | None, prompts: list[str], spatial_avg: bool, output_device: str, seed: Optional[int] = None) -> list[SDRepresentation]:
 
         pipe = self.pipeline
         batch_size = len(images)
