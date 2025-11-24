@@ -7,7 +7,6 @@ import numpy as np
 from typing import Optional, Callable, Any, overload
 from PIL.Image import Image as PILImage
 import PIL.Image
-from dataclasses import dataclass
 from tqdm.autonotebook import trange
 import re
 from abc import ABC, abstractmethod
@@ -35,12 +34,12 @@ class SD:
                 hasattr(obj, 'name')
             ):
                 if simplified_model_name(obj.name) == simplified_name:
-                    return obj(name, **kwargs)
+                    return obj(**kwargs)
                 else:
                     available_models.append(obj.name)
         raise ValueError(f"Model `{name}` not found. Available models: {available_models}")
 
-    def __init__(self, _, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
+    def __init__(self, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
         self.local_files_only = local_files_only
 
         # determine device and dtype
@@ -54,7 +53,7 @@ class SD:
         if hasattr(self, '_load_pipeline'):
             self._load_pipeline()
         else:
-            self.pipeline = AutoPipelineForText2Image.from_pretrained(self.full_name, dtype=torch.float16, local_files_only=local_files_only).to(self.device, dtype=self.dtype)
+            self.pipeline = AutoPipelineForText2Image.from_pretrained(self.full_name, local_files_only=local_files_only).to(self.device, dtype=self.dtype)
         # restore progress bar status
         if progressbar_enabled and disable_progress_bar: diffusers.utils.logging.enable_progress_bar()
 

@@ -1,8 +1,8 @@
+from dataclasses import dataclass
 from PIL.Image import Image as PILImage
 from typing import Optional, Callable
 import torch
 import numpy as np
-
 
 @dataclass
 class SDResult:
