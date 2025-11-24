@@ -1,1 +1,2 @@
-from .sdhelper import SD, SDResult, SDRepresentation
+from .models import SD
+from .data import SDRepresentation, SDResult
