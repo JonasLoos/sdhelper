@@ -605,26 +605,48 @@ class FLUX_base(SD_transformer, ABC):
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
-class FLUX_dev(FLUX_base):
-    name = 'FLUX-dev'
+class FLUX1_dev(FLUX_base):
+    name = 'FLUX.1-dev'
     full_name = 'black-forest-labs/FLUX.1-dev'
     steps = 28
     guidance_scale = 3.5
 
 
-class FLUX_schnell(FLUX_base):
-    name = 'FLUX-schnell'
+class FLUX1_schnell(FLUX_base):
+    name = 'FLUX.1-schnell'
     full_name = 'black-forest-labs/FLUX.1-schnell'
     steps = 4
     guidance_scale = 0.0
 
 
-class FLUX_Krea(FLUX_base):
+class FLUX1_Krea(FLUX_base):
     """FLUX.1 Krea [dev] is a FLUX [dev] variant tuned for strong aesthetics and photorealism. It works as a drop-in text-to-image replacement for FLUX.1-dev and uses the same FluxPipeline architecture, so FLUX_base's img2repr implementation continues to work."""
-    name = "FLUX-Krea"
+    name = "FLUX.1-Krea"
     full_name = "black-forest-labs/FLUX.1-Krea-dev"
     steps = 30
     guidance_scale = 4.5
+
+
+class FLUX2_dev(FLUX_base):
+    """FLUX.2-dev is a 32B parameter flow matching transformer model capable of generating and editing (multiple) images. It is initialized without the mistral-small text encoder to save memory."""
+    name = 'FLUX.2-dev'
+    # full_name = 'black-forest-labs/FLUX.2-dev'
+    full_name = "diffusers/FLUX.2-dev-bnb-4bit"  # use quantized model by default
+    steps = 28
+    guidance_scale = 4.0
+
+    def _load_pipeline(self):
+        try:
+            from diffusers import Flux2Pipeline
+        except ImportError:
+            raise ImportError("Your diffusers package does not support Flux.2-dev, likely because it is too old. Version >= 0.36 is required.")
+
+        self.pipeline = Flux2Pipeline.from_pretrained(
+            self.full_name,
+            text_encoder=None,
+            torch_dtype=torch.bfloat16,
+            local_files_only=self.local_files_only,
+        ).to(self.device)
 
 
 class Playground_V2_5(SD_unet):
@@ -661,21 +683,6 @@ class AuraFlow(SD_transformer):
     full_name = "fal/AuraFlow-v0.3"
     steps = 50
     guidance_scale = 3.5
-
-    def _load_pipeline(self):
-        from diffusers import AuraFlowPipeline
-
-        kwargs = {
-            "torch_dtype": self.dtype,
-            "local_files_only": self.local_files_only,
-        }
-        if self.dtype == torch.float16:
-            kwargs["variant"] = "fp16"
-
-        self.pipeline = AuraFlowPipeline.from_pretrained(
-            self.full_name,
-            **kwargs,
-        ).to(self.device)
 
     def _img2repr(self, *args, **kwargs) -> list[SDRepresentation]:
         raise NotImplementedError("img2repr is not implemented for AuraFlow yet. You can still use AuraFlow for text-to-image generation.")
