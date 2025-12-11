@@ -231,7 +231,12 @@ class SD_unet(SD_base, ABC):
         def latents_callback(pipe, step_index, timestep, callback_kwargs):
             '''callback function to extract intermediate images'''
             latents = callback_kwargs['latents']
-            image = (self.vae_decode(latents)[0] / 2 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
+            decoded = self.vae_decode(latents)[0]
+            # Normalize from [-1, 1] to [0, 1] and clamp to prevent invalid values in cast
+            image = (decoded / 2 + 0.5).clamp(0, 1)
+            # Handle NaN/Inf values
+            image = torch.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
+            image = image.cpu().permute(1, 2, 0).numpy()
             images.extend(self.pipeline.numpy_to_pil(image))
             return callback_kwargs
 
@@ -262,6 +267,8 @@ class SD_unet(SD_base, ABC):
 
         # cast images to same dtype as vae
         result_tensor = self.vae_decode(result.images)
+        # Clamp to [0, 1] and handle NaN/Inf to prevent invalid values in cast (fixes FP16 precision issues)
+        result_tensor = torch.nan_to_num(result_tensor.clamp(0, 1), nan=0.0, posinf=1.0, neginf=0.0)
         result_image = self.pipeline.image_processor.postprocess(result_tensor.detach(), output_type='pil')
 
         # return results
@@ -395,7 +402,8 @@ class SDXL_Lightning_base(SD_unet, ABC):
     guidance_scale = 0.0
 
     def _load_pipeline(self):
-        # SDXL-Lightning needs custom loading because it's designed replace only the unet of SDXL
+        # SDXL-Lightning needs custom loading because it's designed to replace only the unet of SDXL
+        # Based on: https://huggingface.co/ByteDance/SDXL-Lightning
 
         # load dependencies
         from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, EulerDiscreteScheduler
@@ -407,45 +415,66 @@ class SDXL_Lightning_base(SD_unet, ABC):
         repo = "ByteDance/SDXL-Lightning"
         if self.steps == 1:
             ckpt = "sdxl_lightning_1step_unet_x0.safetensors"
-        elif self.steps in [2,4,8]:
+        elif self.steps in [2, 4, 8]:
             ckpt = f"sdxl_lightning_{self.steps}step_unet.safetensors"
         else:
-            raise ValueError(f"Invalid number of steps: {self.steps}")
+            raise ValueError(f"Invalid number of steps: {self.steps}. Supported steps: 1, 2, 4, 8")
 
-        # Load model
-        unet_config = UNet2DConditionModel.load_config(base, subfolder="unet", local_files_only=self.local_files_only)
-        unet: UNet2DConditionModel = UNet2DConditionModel.from_config(unet_config).to(self.device, torch.float16)
-        unet.load_state_dict(load_file(hf_hub_download(repo, ckpt, local_files_only=self.local_files_only), device=self.device))
-        pipe = StableDiffusionXLPipeline.from_pretrained(base, unet=unet, dtype=torch.float16, variant="fp16", local_files_only=self.local_files_only).to(self.device)
+        # Load UNet model
+        # Use load_config() followed by from_config() to avoid deprecation warning
+        unet_config = UNet2DConditionModel.load_config(
+            base,
+            subfolder="unet",
+            local_files_only=self.local_files_only
+        )
+        unet = UNet2DConditionModel.from_config(unet_config).to(self.device, torch.float16)
 
-        # fix sampler
-        extra_kwargs = dict(prediction_type="sample") if self.steps == 1 else {}
-        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing", **extra_kwargs, local_files_only=self.local_files_only)
+        # Load checkpoint
+        checkpoint_path = hf_hub_download(repo, ckpt, local_files_only=self.local_files_only)
+        unet.load_state_dict(load_file(checkpoint_path, device=self.device))
+
+        # Load pipeline with custom UNet
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            base,
+            unet=unet,
+            dtype=torch.float16,
+            variant="fp16",
+            local_files_only=self.local_files_only
+        ).to(self.device)
+
+        # Configure scheduler
+        # For 1-step model, use prediction_type="sample", otherwise use default
+        scheduler_kwargs = {"prediction_type": "sample"} if self.steps == 1 else {}
+        pipe.scheduler = EulerDiscreteScheduler.from_config(
+            pipe.scheduler.config,
+            timestep_spacing="trailing",
+            **scheduler_kwargs
+        )
 
         self.pipeline = pipe
 
 
 class SDXL_Lightning_1step(SDXL_Lightning_base):
     name = 'SDXL-Lightning-1step'
-    full_name = 'ByteDance/sdxl-lightning-1step'
+    full_name = 'ByteDance/SDXL-Lightning'
     steps = 1
 
 
 class SDXL_Lightning_2step(SDXL_Lightning_base):
     name = 'SDXL-Lightning-2step'
-    full_name = 'ByteDance/sdxl-lightning-2step'
+    full_name = 'ByteDance/SDXL-Lightning'
     steps = 2
 
 
 class SDXL_Lightning_4step(SDXL_Lightning_base):
     name = 'SDXL-Lightning-4step'
-    full_name = 'ByteDance/sdxl-lightning-4step'
+    full_name = 'ByteDance/SDXL-Lightning'
     steps = 4
 
 
 class SDXL_Lightning_8step(SDXL_Lightning_base):
     name = 'SDXL-Lightning-8step'
-    full_name = 'ByteDance/sdxl-lightning-8step'
+    full_name = 'ByteDance/SDXL-Lightning'
     steps = 8
 
 
