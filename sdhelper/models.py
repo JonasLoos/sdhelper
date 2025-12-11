@@ -64,7 +64,7 @@ class SD:
         # setup pipeline
         progressbar_enabled = diffusers.utils.logging.is_progress_bar_enabled()
         if progressbar_enabled and disable_progress_bar: diffusers.utils.logging.disable_progress_bar()
-        self.pipeline: 'diffusers.StableDiffusionPipeline | diffusers.StableDiffusionXLPipeline | diffusers.StableDiffusion3Pipeline | diffusers.FluxPipeline | Any'
+        self.pipeline: 'diffusers.StableDiffusionPipeline | diffusers.StableDiffusionXLPipeline | diffusers.StableDiffusion3Pipeline | diffusers.FluxPipeline | diffusers.Flux2Pipeline | Any'
         if hasattr(self, '_load_pipeline'):
             self._load_pipeline()
         else:
@@ -562,7 +562,6 @@ class SD3_5_Large_Turbo(SD3_base):
 class FLUX_base(SD_transformer, ABC):
     """Base class for FLUX models."""
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, resize: int | None, prompts: list[str], spatial_avg: bool, output_device: str, seed: Optional[int] = None) -> list[SDRepresentation]:
-
         pipe = self.pipeline
         batch_size = len(images)
         width, height = images[0].size
@@ -627,19 +626,19 @@ class FLUX1_Krea(FLUX_base):
     guidance_scale = 4.5
 
 
-class FLUX2_dev(FLUX_base):
+class FLUX2_dev(SD_base):
     """FLUX.2-dev is a 32B parameter flow matching transformer model capable of generating and editing (multiple) images. It is initialized without the mistral-small text encoder to save memory."""
     name = 'FLUX.2-dev'
     # full_name = 'black-forest-labs/FLUX.2-dev'
     full_name = "diffusers/FLUX.2-dev-bnb-4bit"  # use quantized model by default
     steps = 28
-    guidance_scale = 4.0
+    guidance_scale = 2.5  # according to https://fal.ai/models/fal-ai/flux-2/api#schema-input
 
     def _load_pipeline(self):
         try:
             from diffusers import Flux2Pipeline
         except ImportError:
-            raise ImportError("Your diffusers package does not support Flux.2-dev, likely because it is too old. Version >= 0.36 is required.")
+            raise ImportError("Your diffusers package does not support Flux.2-dev, likely because it is too old. Version >= 0.36.0 is required.")
 
         self.pipeline = Flux2Pipeline.from_pretrained(
             self.full_name,
@@ -647,6 +646,160 @@ class FLUX2_dev(FLUX_base):
             torch_dtype=torch.bfloat16,
             local_files_only=self.local_files_only,
         ).to(self.device)
+
+
+    @staticmethod
+    def _patchify_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Convert latents from (B, C, H, W) to (B, C*4, H//2, W//2) by packing 2x2 patches."""
+        batch_size, num_channels, height, width = latents.shape
+        latents = latents.view(batch_size, num_channels, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 1, 3, 5, 2, 4)
+        latents = latents.reshape(batch_size, num_channels * 4, height // 2, width // 2)
+        return latents
+
+    @staticmethod
+    def _unpatchify_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Convert latents from (B, C*4, H, W) to (B, C, H*2, W*2) by unpacking 2x2 patches."""
+        batch_size, num_channels, height, width = latents.shape
+        latents = latents.reshape(batch_size, num_channels // 4, 2, 2, height, width)
+        latents = latents.permute(0, 1, 4, 2, 5, 3)
+        latents = latents.reshape(batch_size, num_channels // 4, height * 2, width * 2)
+        return latents
+
+    @torch.no_grad()
+    def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
+        """Encode PIL images to FLUX.2 latents.
+
+        Args:
+            images: List of PIL images to encode.
+
+        Returns:
+            Encoded latents tensor of shape (B, C*4, H//2, W//2) after patchification and batch normalization.
+        """
+        vae = self.pipeline.vae
+        vae_dtype = next(vae.parameters()).dtype
+
+        # Preprocess images to tensor
+        img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
+
+        # Encode with VAE
+        latents = vae.encode(img_tensor).latent_dist.mode()
+
+        # Patchify latents (2x2 patches)
+        latents = self._patchify_latents(latents)
+
+        # Apply batch normalization
+        bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(latents.device, latents.dtype)
+        latents = (latents - bn_mean) / bn_std
+
+        return latents.to(dtype=self.dtype)
+
+    @torch.no_grad()
+    def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
+        """Decode FLUX.2 latents to PIL images.
+
+        Args:
+            latents: Latents tensor of shape (B, C*4, H//2, W//2) (patchified and batch-normalized).
+
+        Returns:
+            List of decoded PIL images.
+        """
+        vae = self.pipeline.vae
+        vae_dtype = next(vae.parameters()).dtype
+        latents = latents.to(device=self.device, dtype=vae_dtype)
+
+        # Reverse batch normalization
+        bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(latents.device, latents.dtype)
+        latents = latents * bn_std + bn_mean
+
+        # Unpatchify latents
+        latents = self._unpatchify_latents(latents)
+
+        # Decode with VAE
+        image = vae.decode(latents, return_dict=False)[0]
+
+        # Postprocess to PIL images
+        return self.pipeline.image_processor.postprocess(image, output_type="pil")
+
+    @staticmethod
+    def _compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+        """Compute mu for dynamic shifting scheduler (from Flux2Pipeline)."""
+        # see https://github.com/black-forest-labs/flux2/blob/5a5d316b1b42f6b59a8c9194b77c8256be848432/src/flux2/sampling.py#L251
+        a1, b1 = 8.73809524e-05, 1.89833333
+        a2, b2 = 0.00016927, 0.45666666
+
+        if image_seq_len > 4300:
+            mu = a2 * image_seq_len + b2
+            return float(mu)
+
+        m_200 = a2 * image_seq_len + b2
+        m_10 = a1 * image_seq_len + b1
+
+        a = (m_200 - m_10) / 190.0
+        b = m_200 - 200.0 * a
+        mu = a * num_steps + b
+
+        return float(mu)
+
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, resize: int | None, prompts: list[str], spatial_avg: bool, output_device: str, seed: Optional[int] = None) -> list[SDRepresentation]:
+        pipe = self.pipeline
+        batch_size = len(images)
+        width, height = images[0].size
+        representations = {}
+
+        # Set seed if provided
+        if seed is None: seed = int(torch.randint(0, 2**32, (1,)).item())
+        torch.manual_seed(seed)
+
+        # encode image
+        images_resized = [img.resize((resize, resize)) if resize is not None else img for img in images]
+        latents = self.encode_latents(images_resized)
+        noise = torch.randn_like(latents[None,0]).expand(latents.shape)  # expand to ensure each image is noised with the same noise/seed
+
+        # compute image sequence length for dynamic shifting
+        # latents shape after encode: (B, C*4, H//2, W//2) where H, W are latent dims
+        _, _, latent_h, latent_w = latents.shape
+        image_seq_len = latent_h * latent_w
+
+        # timestep - compute mu for dynamic shifting
+        num_steps = 1000
+        mu = self._compute_empirical_mu(image_seq_len, num_steps)
+        pipe.scheduler.set_timesteps(num_steps, device=pipe.device, mu=mu)
+        # Get the actual timestep from the scheduler's computed timesteps
+        timestep = pipe.scheduler.timesteps[999 - step]
+
+        # use empty prompt embeds, prompts are not supported yet
+        prompt_embeds = torch.zeros((batch_size, 1, 6144), device=self.device, dtype=torch.bfloat16)
+        # prepare text position IDs (required for FLUX.2 transformer)
+        txt_ids = pipe._prepare_text_ids(prompt_embeds).to(self.device)
+
+        # prepare and noise latents
+        latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0).unsqueeze(0), noise=noise)
+        # prepare_latents already packs the latents internally via _pack_latents
+        latents, latent_image_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, prompt_embeds.dtype, pipe.device, generator=torch.manual_seed(seed), latents=latents)
+
+        # guidance tensor (required for FLUX.2 transformer)
+        guidance = torch.full([1], self.guidance_scale, device=self.device, dtype=torch.float32)
+        guidance = guidance.expand(latents.shape[0])
+
+        # extract representations
+        with ExitStack() as stack, torch.no_grad():
+            for extract_position in extract_positions:
+                def hook_fn(module, input, output, extract_position):
+                    representations[extract_position] = output[1].to(output_device)
+                stack.enter_context(get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+            pipe.transformer(hidden_states=latents, timestep=(timestep / 1000).expand(latents.shape[0]).to(latents.dtype), guidance=guidance, encoder_hidden_states=prompt_embeds, txt_ids=txt_ids, img_ids=latent_image_ids)
+
+        # fix representation shape
+        num_tokens = next(iter(representations.values())).shape[1]
+        potential_repr_shapes = [(i, num_tokens//i) for i in range(1, num_tokens) if num_tokens % i == 0]
+        repr_shape = min(potential_repr_shapes, key=lambda x: abs(x[1]/x[0] - width / height))
+        representations = {p: r.reshape(batch_size, *repr_shape, 6144).permute(0, 3, 1, 2) for p, r in representations.items()}
+
+        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
+
 
 
 class Playground_V2_5(SD_unet):
