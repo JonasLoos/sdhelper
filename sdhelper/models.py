@@ -693,7 +693,7 @@ class FLUX2_dev(SD_base):
         bn_std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(latents.device, latents.dtype)
         latents = (latents - bn_mean) / bn_std
 
-        return latents.to(dtype=self.dtype)
+        return latents.to(dtype=torch.bfloat16)  # FLUX.2 uses bfloat16
 
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
@@ -753,53 +753,52 @@ class FLUX2_dev(SD_base):
         if seed is None: seed = int(torch.randint(0, 2**32, (1,)).item())
         torch.manual_seed(seed)
 
-        # encode image
+        # Encode image to latents
         images_resized = [img.resize((resize, resize)) if resize is not None else img for img in images]
         latents = self.encode_latents(images_resized)
-        noise = torch.randn_like(latents[None,0]).expand(latents.shape)  # expand to ensure each image is noised with the same noise/seed
+        noise = torch.randn_like(latents[None, 0]).expand(latents.shape)
 
-        # compute image sequence length for dynamic shifting
-        # latents shape after encode: (B, C*4, H//2, W//2) where H, W are latent dims
+        # Setup scheduler with dynamic shifting
         _, _, latent_h, latent_w = latents.shape
-        image_seq_len = latent_h * latent_w
-
-        # timestep - compute mu for dynamic shifting
         num_steps = 1000
-        mu = self._compute_empirical_mu(image_seq_len, num_steps)
-        pipe.scheduler.set_timesteps(num_steps, device=pipe.device, mu=mu)
-        # Get the actual timestep from the scheduler's computed timesteps
+        mu = self._compute_empirical_mu(latent_h * latent_w, num_steps)
+        pipe.scheduler.set_timesteps(num_steps, device=self.device, mu=mu)
         timestep = pipe.scheduler.timesteps[999 - step]
 
-        # use empty prompt embeds, prompts are not supported yet
-        prompt_embeds = torch.zeros((batch_size, 1, 6144), device=self.device, dtype=torch.bfloat16)
-        # prepare text position IDs (required for FLUX.2 transformer)
+        # Prepare prompt embeddings (15360 = 3 text encoder layers × 5120 hidden dim)
+        prompt_embeds = torch.randn((batch_size, 1, 15360), device=self.device, dtype=torch.bfloat16) * 0.01
         txt_ids = pipe._prepare_text_ids(prompt_embeds).to(self.device)
 
-        # prepare and noise latents
+        # Add noise and prepare latents for transformer
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0).unsqueeze(0), noise=noise)
-        # prepare_latents already packs the latents internally via _pack_latents
-        latents, latent_image_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, prompt_embeds.dtype, pipe.device, generator=torch.manual_seed(seed), latents=latents)
+        latents, img_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, torch.bfloat16, self.device, generator=torch.manual_seed(seed), latents=latents)
 
-        # guidance tensor (required for FLUX.2 transformer)
-        guidance = torch.full([1], self.guidance_scale, device=self.device, dtype=torch.float32)
-        guidance = guidance.expand(latents.shape[0])
+        # Prepare guidance
+        guidance = torch.full([latents.shape[0]], self.guidance_scale, device=self.device, dtype=torch.bfloat16)
 
-        # extract representations
+        # Extract representations via hooks
         with ExitStack() as stack, torch.no_grad():
-            for extract_position in extract_positions:
-                def hook_fn(module, input, output, extract_position):
-                    representations[extract_position] = output[1].to(output_device)
-                stack.enter_context(get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
-            pipe.transformer(hidden_states=latents, timestep=(timestep / 1000).expand(latents.shape[0]).to(latents.dtype), guidance=guidance, encoder_hidden_states=prompt_embeds, txt_ids=txt_ids, img_ids=latent_image_ids)
+            for pos in extract_positions:
+                def hook_fn(module, input, output, pos=pos):
+                    out = output[1] if isinstance(output, tuple) and len(output) >= 2 else (output[0] if isinstance(output, tuple) else output)
+                    representations[pos] = out.to(output_device)
+                stack.enter_context(get_module_by_path(pipe.transformer, pos).register_forward_hook(hook_fn))
+            pipe.transformer(
+                hidden_states=latents,
+                timestep=(timestep / 1000).expand(latents.shape[0]).to(torch.bfloat16),
+                guidance=guidance,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=txt_ids,
+                img_ids=img_ids,
+            )
 
-        # fix representation shape
+        # Reshape representations to spatial format
         num_tokens = next(iter(representations.values())).shape[1]
-        potential_repr_shapes = [(i, num_tokens//i) for i in range(1, num_tokens) if num_tokens % i == 0]
-        repr_shape = min(potential_repr_shapes, key=lambda x: abs(x[1]/x[0] - width / height))
+        potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
+        repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
         representations = {p: r.reshape(batch_size, *repr_shape, 6144).permute(0, 3, 1, 2) for p, r in representations.items()}
 
-        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
-
+        return [SDRepresentation({p: r[i, None] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
 class Playground_V2_5(SD_unet):

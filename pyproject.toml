@@ -16,6 +16,7 @@ dependencies = [
     "accelerate",
     "protobuf",
     "sentencepiece",
+    "bitsandbytes",
 ]
 
 [project.urls]
