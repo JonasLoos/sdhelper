@@ -250,12 +250,7 @@ class SDUnet(SDBase, ABC):
         def latents_callback(pipe, step_index, timestep, callback_kwargs):
             '''callback function to extract intermediate images'''
             latents = callback_kwargs['latents']
-            decoded = self.vae_decode(latents)[0]
-            # Normalize from [-1, 1] to [0, 1] and clamp to prevent invalid values in cast
-            image = (decoded / 2 + 0.5).clamp(0, 1)
-            # Handle NaN/Inf values
-            image = torch.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
-            image = image.cpu().permute(1, 2, 0).numpy()
+            image = (self.vae_decode(latents)[0] / 2 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
             images.extend(self.pipeline.numpy_to_pil(image))
             return callback_kwargs
 
@@ -286,8 +281,6 @@ class SDUnet(SDBase, ABC):
 
         # cast images to same dtype as vae
         result_tensor = self.vae_decode(result.images)
-        # Clamp to [0, 1] and handle NaN/Inf to prevent invalid values in cast (fixes FP16 precision issues)
-        result_tensor = torch.nan_to_num(result_tensor.clamp(0, 1), nan=0.0, posinf=1.0, neginf=0.0)
         result_image = self.pipeline.image_processor.postprocess(result_tensor.detach(), output_type='pil')
 
         # return results
