@@ -67,4 +67,4 @@ flux.quantize(['transformer', 'text_encoder_2'], model_cpu_offload=True)
 ```
 
 > [!NOTE]
-> † - The official original repositories of [`SD1.5`](https://huggingface.co/runwayml/stable-diffusion-v1-5), [`SD2.0`](https://huggingface.co/stabilityai/stable-diffusion-2), and [`SD2.1`](https://huggingface.co/stabilityai/stable-diffusion-2-1) were deleted.
+> † The official original repositories of [`SD1.5`](https://huggingface.co/runwayml/stable-diffusion-v1-5), [`SD2.0`](https://huggingface.co/stabilityai/stable-diffusion-2), and [`SD2.1`](https://huggingface.co/stabilityai/stable-diffusion-2-1) were deleted. Alternative unofficial repositories are used instead.
