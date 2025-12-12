@@ -395,21 +395,29 @@ class SD_Turbo(SDUnet):
     guidance_scale = 0.0
 
 
-class SDXL(SDUnet):
+class SDXLBase(SDUnet, ABC):
+    def _load_pipeline(self):
+        self.pipeline = AutoPipelineForText2Image.from_pretrained(self.full_name, torch_dtype=torch.float16, local_files_only=self.local_files_only).to(self.device, dtype=self.dtype)
+
+        # upcast vae to float32 to avoid precision issues
+        self.pipeline.vae.to(dtype=torch.float32)
+
+
+class SDXL(SDXLBase):
     name = 'SDXL'
     full_name = 'stabilityai/stable-diffusion-xl-base-1.0'
     steps = 40
     guidance_scale = 5.0  # TODO: is this correct?
 
 
-class SDXL_Turbo(SDUnet):
+class SDXL_Turbo(SDXLBase):
     name = 'SDXL-Turbo'
     full_name = 'stabilityai/sdxl-turbo'
     steps = 4
     guidance_scale = 0.0
 
 
-class SDXL_Lightning_base(SDUnet, ABC):
+class SDXL_Lightning_base(SDXLBase, ABC):
     """Base class for SDXL-Lightning models."""
     guidance_scale = 0.0
 
@@ -433,7 +441,6 @@ class SDXL_Lightning_base(SDUnet, ABC):
             raise ValueError(f"Invalid number of steps: {self.steps}. Supported steps: 1, 2, 4, 8")
 
         # Load UNet model
-        # Use load_config() followed by from_config() to avoid deprecation warning
         unet_config = UNet2DConditionModel.load_config(
             base,
             subfolder="unet",
@@ -449,8 +456,7 @@ class SDXL_Lightning_base(SDUnet, ABC):
         pipe = StableDiffusionXLPipeline.from_pretrained(
             base,
             unet=unet,
-            dtype=torch.float16,
-            variant="fp16",
+            torch_dtype=torch.float16,
             local_files_only=self.local_files_only
         ).to(self.device)
 
@@ -462,6 +468,9 @@ class SDXL_Lightning_base(SDUnet, ABC):
             timestep_spacing="trailing",
             **scheduler_kwargs
         )
+
+        # upcast vae to float32 to avoid precision issues
+        pipe.vae.to(dtype=torch.float32)
 
         self.pipeline = pipe
 
