@@ -49,7 +49,7 @@ def SD(name: str, device: str = 'auto', disable_progress_bar: bool = False, loca
     Args:
         name: Model name (e.g., 'SD1.5', 'FLUX-schnell', 'SDXL-Turbo').
               Name matching is case-insensitive and ignores separators.
-        device: Device to run the model on (e.g., 'cuda', 'cpu').
+        device: Device to run the model on (e.g., 'cuda', 'cpu', 'mps').
         disable_progress_bar: Whether to disable the progress bar.
         local_files_only: Whether to only use local files.
 
@@ -85,7 +85,7 @@ class SDBase:
         self.local_files_only = local_files_only
 
         # determine device and dtype
-        self.device = device if device != 'auto' else 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = device if device != 'auto' else 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
         self.dtype = torch.float32 if self.device == 'cpu' else torch.float16
 
         # setup pipeline
