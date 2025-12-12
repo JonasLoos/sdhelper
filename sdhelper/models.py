@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from .data import SDRepresentation, SDResult
 
 
-def get_module_by_path(model: Any, path: str) -> Any:
+def _get_module_by_path(model: Any, path: str) -> Any:
     """Safely navigate to a module using a path string."""
     current = model
     for name, index in re.findall(r'(\w+)(?:\[(\d+)\])?', path):
@@ -29,32 +29,59 @@ def get_module_by_path(model: Any, path: str) -> Any:
     return current
 
 
-class SD:
-    name: str
-    full_name: str
-    steps: int
-    guidance_scale: float
+def _normalize_model_name(name: str) -> str:
+    """Normalize model name for matching (lowercase, no separators)."""
+    return re.sub(r'\s|\.|-|_', '', name).lower()
 
-    def __new__(cls, name: str, **kwargs):
-        def simplified_model_name(name: str) -> str:
-            return re.sub(r'\s|\.|-|_', '', name).lower()
-        simplified_name = simplified_model_name(name)
-        # Iterate through the global namespace to find a subclass with the given name
-        available_models = []
-        for obj in globals().values():
-            if (
-                isinstance(obj, type) and
-                issubclass(obj, SD) and
-                obj is not SD and
-                hasattr(obj, 'name')
-            ):
-                if simplified_model_name(obj.name) == simplified_name:
-                    return obj(**kwargs)
-                else:
-                    available_models.append(obj.name)
-        raise ValueError(f"Model `{name}` not found. Available models: {available_models}")
 
-    def __init__(self, name: str = '', device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
+def _get_all_subclasses(cls: type) -> list[type]:
+    """Recursively get all subclasses of a class."""
+    subclasses = []
+    for subclass in cls.__subclasses__():
+        subclasses.append(subclass)
+        subclasses.extend(_get_all_subclasses(subclass))
+    return subclasses
+
+
+def SD(name: str, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False) -> 'SDBase':
+    """Factory function to create a Stable Diffusion model instance by name.
+
+    Args:
+        name: Model name (e.g., 'SD1.5', 'FLUX-schnell', 'SDXL-Turbo').
+              Name matching is case-insensitive and ignores separators.
+        device: Device to run the model on (e.g., 'cuda', 'cpu').
+        disable_progress_bar: Whether to disable the progress bar.
+        local_files_only: Whether to only use local files.
+
+    Returns:
+        An instance of the requested SD model.
+
+    Raises:
+        ValueError: If the model name is not found.
+
+    Example:
+        >>> model = SD('SD1.5', device='cuda')
+        >>> model = SD('FLUX-schnell', disable_progress_bar=True)
+    """
+    target = _normalize_model_name(name)
+
+    # Build registry from all SDBase subclasses
+    registry: dict[str, type[SDBase]] = {}
+    for cls in _get_all_subclasses(SDBase):
+        if hasattr(cls, 'name') and isinstance(cls.name, str):
+            normalized = _normalize_model_name(cls.name)
+            registry[normalized] = cls
+
+    if target not in registry:
+        available = sorted(set(cls.name for cls in registry.values()))
+        raise ValueError(f"Model `{name}` not found. Available models: {available}")
+
+    return registry[target](device=device, disable_progress_bar=disable_progress_bar, local_files_only=local_files_only)
+
+
+class SDBase:
+    """Base class for (Stable) Diffusion models."""
+    def __init__(self, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
         self.local_files_only = local_files_only
 
         # determine device and dtype
@@ -189,15 +216,7 @@ class SD:
         return representations[0] if single else representations
 
 
-class SD_base(SD, ABC):
-    """Base class for SD models."""
-
-    # dont use the SD.__new__ method, as it's not a real class.
-    def __new__(cls, *args, **kwargs):
-        return object.__new__(cls)
-
-
-class SD_unet(SD_base, ABC):
+class SDUnet(SDBase, ABC):
     """base class for SD models with a U-Net architecture"""
 
     @torch.no_grad()
@@ -250,7 +269,7 @@ class SD_unet(SD_base, ABC):
                     representations[extract_position].append(output)
                     if modification:
                         return modification(module, input, output, extract_position)
-                stack.enter_context(get_module_by_path(self.pipeline.unet, extract_position).register_forward_hook(partial(get_repr, extract_position=extract_position)))
+                stack.enter_context(_get_module_by_path(self.pipeline.unet, extract_position).register_forward_hook(partial(get_repr, extract_position=extract_position)))
 
             # run pipeline
             result = self.pipeline(
@@ -320,41 +339,41 @@ class SD_unet(SD_base, ABC):
                     if spatial_avg:
                         output = output.mean(dim=(2, 3))
                     representations[extract_position] = output.to(output_device)
-                stack.enter_context(get_module_by_path(pipe.unet, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+                stack.enter_context(_get_module_by_path(pipe.unet, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
             pipe.unet(latents, timestep, encoder_hidden_states=prompt_embeds)
 
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
-class SD1_1(SD_unet):
+class SD1_1(SDUnet):
     name = 'SD1.1'
     full_name = 'CompVis/stable-diffusion-v1-1'
     steps = 50
     guidance_scale = 7.5
 
 
-class SD1_2(SD_unet):
+class SD1_2(SDUnet):
     name = 'SD1.2'
     full_name = 'CompVis/stable-diffusion-v1-2'
     steps = 50
     guidance_scale = 7.5
 
 
-class SD1_3(SD_unet):
+class SD1_3(SDUnet):
     name = 'SD1.3'
     full_name = 'CompVis/stable-diffusion-v1-3'
     steps = 50
     guidance_scale = 7.5
 
 
-class SD1_4(SD_unet):
+class SD1_4(SDUnet):
     name = 'SD1.4'
     full_name = 'CompVis/stable-diffusion-v1-4'
     steps = 50
     guidance_scale = 7.5
 
 
-class SD1_5(SD_unet):
+class SD1_5(SDUnet):
     name = 'SD1.5'
     # full_name = 'runwayml/stable-diffusion-v1-5',  # Runwayml deleted their repo
     full_name = 'stable-diffusion-v1-5/stable-diffusion-v1-5'
@@ -362,42 +381,42 @@ class SD1_5(SD_unet):
     guidance_scale = 7.5
 
 
-class SD2_0(SD_unet):
+class SD2_0(SDUnet):
     name = 'SD2.0'
     full_name = 'stabilityai/stable-diffusion-2'
     steps = 50
     guidance_scale = 7.5
 
 
-class SD2_1(SD_unet):
+class SD2_1(SDUnet):
     name = 'SD2.1'
     full_name = 'stabilityai/stable-diffusion-2-1'
     steps = 50
     guidance_scale = 7.5
 
 
-class SD_Turbo(SD_unet):
+class SD_Turbo(SDUnet):
     name = 'SD-Turbo'
     full_name = 'stabilityai/sd-turbo'
     steps = 4
     guidance_scale = 0.0
 
 
-class SDXL(SD_unet):
+class SDXL(SDUnet):
     name = 'SDXL'
     full_name = 'stabilityai/stable-diffusion-xl-base-1.0'
     steps = 40
     guidance_scale = 5.0  # TODO: is this correct?
 
 
-class SDXL_Turbo(SD_unet):
+class SDXL_Turbo(SDUnet):
     name = 'SDXL-Turbo'
     full_name = 'stabilityai/sdxl-turbo'
     steps = 4
     guidance_scale = 0.0
 
 
-class SDXL_Lightning_base(SD_unet, ABC):
+class SDXL_Lightning_base(SDUnet, ABC):
     """Base class for SDXL-Lightning models."""
     guidance_scale = 0.0
 
@@ -478,7 +497,7 @@ class SDXL_Lightning_8step(SDXL_Lightning_base):
     steps = 8
 
 
-class SD_transformer(SD_base, ABC):
+class SDTransformer(SDBase, ABC):
     """base class for SD models with a transformer architecture"""
 
     @torch.no_grad()
@@ -514,7 +533,7 @@ class SD_transformer(SD_base, ABC):
         )
 
 
-class SD3_base(SD_transformer, ABC):
+class SD3Base(SDTransformer, ABC):
     """Base class for SD3 models."""
     latent_dim = 1536
 
@@ -544,7 +563,7 @@ class SD3_base(SD_transformer, ABC):
             for extract_position in extract_positions:
                 def hook_fn(module, input, output, extract_position):
                         representations[extract_position] = output[1].to(output_device)
-                stack.enter_context(get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+                stack.enter_context(_get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(device=self.device), encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds)
 
         # fix representation shape
@@ -556,7 +575,7 @@ class SD3_base(SD_transformer, ABC):
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
-class SD3(SD3_base):
+class SD3(SD3Base):
     name = 'SD3'
     full_name = 'stabilityai/stable-diffusion-3-medium-diffusers'
     steps = 28
@@ -564,7 +583,7 @@ class SD3(SD3_base):
     latent_dim = 1536
 
 
-class SD3_5_Large(SD3_base):
+class SD3_5_Large(SD3Base):
     name = 'SD3.5-Large'
     full_name = 'stabilityai/stable-diffusion-3.5-large'
     steps = 28
@@ -572,7 +591,7 @@ class SD3_5_Large(SD3_base):
     latent_dim = 2432
 
 
-class SD3_5_Medium(SD3_base):
+class SD3_5_Medium(SD3Base):
     name = 'SD3.5-Medium'
     full_name = 'stabilityai/stable-diffusion-3.5-medium'
     steps = 28
@@ -580,7 +599,7 @@ class SD3_5_Medium(SD3_base):
     latent_dim = 2432
 
 
-class SD3_5_Large_Turbo(SD3_base):
+class SD3_5_Large_Turbo(SD3Base):
     name = 'SD3.5-Large-Turbo'
     full_name = 'stabilityai/stable-diffusion-3.5-large-turbo'
     steps = 4
@@ -588,7 +607,7 @@ class SD3_5_Large_Turbo(SD3_base):
     latent_dim = 2432
 
 
-class FLUX_base(SD_transformer, ABC):
+class FLUXBase(SDTransformer, ABC):
     """Base class for FLUX models."""
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, resize: int | None, prompts: list[str], spatial_avg: bool, output_device: str, seed: Optional[int] = None) -> list[SDRepresentation]:
         pipe = self.pipeline
@@ -621,7 +640,7 @@ class FLUX_base(SD_transformer, ABC):
             for extract_position in extract_positions:
                 def hook_fn(module, input, output, extract_position):
                     representations[extract_position] = output[1].to(output_device)
-                stack.enter_context(get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+                stack.enter_context(_get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000, guidance=None, encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds, txt_ids=text_ids, img_ids=latent_image_ids)
 
         # fix representation shape
@@ -633,29 +652,29 @@ class FLUX_base(SD_transformer, ABC):
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
-class FLUX1_dev(FLUX_base):
+class FLUX1_dev(FLUXBase):
     name = 'FLUX.1-dev'
     full_name = 'black-forest-labs/FLUX.1-dev'
     steps = 28
     guidance_scale = 3.5
 
 
-class FLUX1_schnell(FLUX_base):
+class FLUX1_schnell(FLUXBase):
     name = 'FLUX.1-schnell'
     full_name = 'black-forest-labs/FLUX.1-schnell'
     steps = 4
     guidance_scale = 0.0
 
 
-class FLUX1_Krea(FLUX_base):
-    """FLUX.1 Krea [dev] is a FLUX [dev] variant tuned for strong aesthetics and photorealism. It works as a drop-in text-to-image replacement for FLUX.1-dev and uses the same FluxPipeline architecture, so FLUX_base's img2repr implementation continues to work."""
+class FLUX1_Krea(FLUXBase):
+    """FLUX.1 Krea [dev] is a FLUX [dev] variant tuned for strong aesthetics and photorealism. It works as a drop-in text-to-image replacement for FLUX.1-dev and uses the same FluxPipeline architecture, so FLUXBase's img2repr implementation continues to work."""
     name = "FLUX.1-Krea"
     full_name = "black-forest-labs/FLUX.1-Krea-dev"
     steps = 30
     guidance_scale = 4.5
 
 
-class FLUX2_dev(SD_base):
+class FLUX2_dev(SDBase):
     """FLUX.2-dev is a 32B parameter flow matching transformer model capable of generating and editing (multiple) images. It is initialized without the mistral-small text encoder to save memory."""
     name = 'FLUX.2-dev'
     # full_name = 'black-forest-labs/FLUX.2-dev'
@@ -811,7 +830,7 @@ class FLUX2_dev(SD_base):
                 def hook_fn(module, input, output, pos=pos):
                     out = output[1] if isinstance(output, tuple) and len(output) >= 2 else (output[0] if isinstance(output, tuple) else output)
                     representations[pos] = out.to(output_device)
-                stack.enter_context(get_module_by_path(pipe.transformer, pos).register_forward_hook(hook_fn))
+                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(hook_fn))
             pipe.transformer(
                 hidden_states=latents,
                 timestep=(timestep / 1000).expand(latents.shape[0]).to(torch.bfloat16),
@@ -830,11 +849,11 @@ class FLUX2_dev(SD_base):
         return [SDRepresentation({p: r[i, None] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
-class Playground_V2_5(SD_unet):
+class Playground_V2_5(SDUnet):
     """
     Playground v2.5 1024px aesthetic checkpoint.
 
-    SDXL-style UNet + VAE, so we can reuse SD_unet's encode/decode/img2repr
+    SDXL-style UNet + VAE, so we can reuse SDUnet's encode/decode/img2repr
     path exactly like SDXL.
     """
     name = "Playground-v2.5"
@@ -858,7 +877,7 @@ class Playground_V2_5(SD_unet):
         ).to(self.device)
 
 
-class AuraFlow(SD_transformer):
+class AuraFlow(SDTransformer):
     """AuraFlow v0.3 is a large rectified flow T2I model with a dedicated AuraFlowPipeline."""
     name = "AuraFlow"
     full_name = "fal/AuraFlow-v0.3"
@@ -869,12 +888,13 @@ class AuraFlow(SD_transformer):
         raise NotImplementedError("img2repr is not implemented for AuraFlow yet. You can still use AuraFlow for text-to-image generation.")
 
 
-class Kandinsky3(SD_base):
+class Kandinsky3(SDBase):
     """Kandinsky-3 is a U-Net based latent diffusion model with a Flan-UL2 text encoder and a MoVQ encoder/decoder."""
     name = "Kandinsky-3"
     full_name = "kandinsky-community/kandinsky-3"
     steps = 25
     guidance_scale = 4.0
+
     def _load_pipeline(self):
         kwargs = {
             "torch_dtype": self.dtype,
