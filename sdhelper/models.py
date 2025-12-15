@@ -46,7 +46,7 @@ def _get_all_subclasses(cls: type) -> list[type]:
 def _reshape_representations_to_spatial(representations: dict[str, torch.Tensor], batch_size: int, width: int, height: int) -> dict[str, torch.Tensor]:
     """Reshape representation tensors from sequence format to spatial format.
 
-    Converts representations from (B, L, D) to (B, 1,  D, H, W) format, where the spatial
+    Converts representations from (B, L, D) to (B, 1, D, H, W) format, where the spatial
     dimensions (H, W) are chosen to best match the aspect ratio of the original image.
 
     Args:
@@ -63,7 +63,7 @@ def _reshape_representations_to_spatial(representations: dict[str, torch.Tensor]
         num_tokens = r.shape[1]
         potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
         repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
-        result[p] = r.reshape(batch_size, 1, *repr_shape, -1).permute(0, 3, 1, 2)
+        result[p] = r.reshape(batch_size, 1, *repr_shape, -1).permute(0, 1, 4, 2, 3)
     return result
 
 
@@ -983,7 +983,7 @@ class ZImageTurbo(SDBase):
         try:
             from diffusers import ZImagePipeline
         except ImportError:
-            raise ImportError("Your diffusers package does not support Z-Image-Turbo, likely because it is too old. Version >= 0.36.0 is required.")
+            raise ImportError("ZImagePipeline not found in diffusers. Please ensure you have a compatible version installed.")
 
         self.pipeline = ZImagePipeline.from_pretrained(
             self.full_name,
@@ -1029,11 +1029,11 @@ class ZImageTurbo(SDBase):
         b = base_shift - m * base_seq_len
         mu = image_seq_len * m + b
 
+        # handle timestep/noise
         pipe.scheduler.set_timesteps(1000, device=self.device, mu=mu)
         timestep = pipe.scheduler.timesteps[999 - step]
-
-        # scale noise
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
+        timestep_model_input = (1000 - timestep.expand(latents.shape[0])) / 1000
 
         # encode prompts
         prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
@@ -1042,13 +1042,7 @@ class ZImageTurbo(SDBase):
             do_classifier_free_guidance=False,
         )
 
-        # Prepare transformer inputs
-        timestep_model_input = timestep.expand(latents.shape[0])
-        timestep_model_input = (1000 - timestep_model_input) / 1000
-
-        latent_model_input = latents.to(pipe.transformer.dtype)
-        latent_model_input = latent_model_input.unsqueeze(2)
-        latent_model_input_list = list(latent_model_input.unbind(dim=0))
+        latent_model_input = list(latents.to(pipe.transformer.dtype).unsqueeze(2).unbind(dim=0))
 
         representations = {}
         def hook_fn(module, input, output, pos):
@@ -1061,7 +1055,7 @@ class ZImageTurbo(SDBase):
                 stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
 
             pipe.transformer(
-                latent_model_input_list,
+                latent_model_input,
                 timestep_model_input.to(dtype=pipe.transformer.dtype),
                 prompt_embeds,
                 return_dict=False
