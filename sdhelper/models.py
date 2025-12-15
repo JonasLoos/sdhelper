@@ -907,8 +907,8 @@ class AuraFlow(SDBase):
         pipe.scheduler.set_timesteps(1000, device=self.device)
         timestep_val = pipe.scheduler.timesteps[999 - step]
 
-        # Add noise
-        latents = pipe.scheduler.add_noise(latents, noise, timestep_val.unsqueeze(0))
+        # Scale noise (flow matching uses scale_noise instead of add_noise)
+        latents = pipe.scheduler.scale_noise(latents, timestep=timestep_val.unsqueeze(0), noise=noise)
 
         # encode prompts
         # encode_prompt returns (prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask)
