@@ -892,6 +892,18 @@ class AuraFlow(SDBase):
     steps = 50
     guidance_scale = 3.5
 
+    def _load_pipeline(self):
+        from diffusers import AuraFlowPipeline
+
+        self.pipeline = AuraFlowPipeline.from_pretrained(
+            self.full_name,
+            torch_dtype=self.dtype,
+            local_files_only=self.local_files_only,
+        ).to(self.device)
+
+        # upcast vae to float32 to avoid precision issues
+        self.pipeline.vae.to(dtype=torch.float32)
+
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
         vae = self.pipeline.vae
@@ -971,7 +983,7 @@ class ZImageTurbo(SDBase):
         try:
             from diffusers import ZImagePipeline
         except ImportError:
-            raise ImportError("ZImagePipeline not found in diffusers. Please ensure you have a compatible version installed.")
+            raise ImportError("Your diffusers package does not support Z-Image-Turbo, likely because it is too old. Version >= 0.36.0 is required.")
 
         self.pipeline = ZImagePipeline.from_pretrained(
             self.full_name,
