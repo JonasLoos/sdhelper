@@ -114,6 +114,21 @@ class SDBase(ABC):
         if seed is None: seed = int(torch.randint(0, 2**32, (1,)).item())
         return self._generate(prompt, steps, guidance_scale, seed, width=width, height=height, modification=modification, extract_positions=extract_positions)
 
+    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
+        if modification is not None or len(extract_positions) > 0:
+            raise ValueError(f'{self.name} support for modifications, or extract positions is not implemented yet.')
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        result_images = self.pipeline(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height, generator=generator)
+        return SDResult(
+            prompt=prompt,
+            seed=seed,
+            representations=None,
+            images=None,
+            result_latent=None,
+            result_tensor=None,
+            result_image=result_images.images[0],
+        )
+
     def quantize(self, quantization_modules: list[str] | None = None, quantization_type: str = 'qfloat8', model_cpu_offload: bool = False, sequential_cpu_offload: bool = False):
         '''Optimize VRAM usage of the model.
 
@@ -516,20 +531,6 @@ class SDTransformer(SDBase, ABC):
         tmp = pipe.vae.decode((latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor, return_dict=False)
         return pipe.image_processor.postprocess(tmp)  # type: ignore
 
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
-        if modification is not None or len(extract_positions) > 0:
-            raise ValueError(f'{self.name} support for modifications, or extract positions is not implemented yet.')
-        result_images = self.pipeline(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height)
-        return SDResult(
-            prompt=prompt,
-            seed=seed,
-            representations=None,
-            images=None,
-            result_latent=None,
-            result_tensor=None,
-            result_image=result_images.images[0],
-        )
-
 
 class SD3Base(SDTransformer, ABC):
     """Base class for SD3 models."""
@@ -878,14 +879,77 @@ class AuraFlow(SDBase):
 
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
-        raise NotImplementedError()
+        vae = self.pipeline.vae
+        vae_dtype = next(vae.parameters()).dtype
+        img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
+        latents = vae.encode(img_tensor).latent_dist.sample()
+        latents = latents * vae.config.scaling_factor
+        return latents.to(dtype=self.dtype)
 
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
-        raise NotImplementedError()
+        vae = self.pipeline.vae
+        latents = latents / vae.config.scaling_factor
+        image = vae.decode(latents, return_dict=False)[0]
+        return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
-        raise NotImplementedError("img2repr is not implemented for AuraFlow yet. You can still use AuraFlow for text-to-image generation.")
+        pipe = self.pipeline
+        batch_size = len(images)
+        width, height = images[0].size
+        representations = {}
+
+        # encode image
+        latents = self.encode_latents(images)
+        noise = torch.randn_like(latents[None,0]).expand(latents.shape)
+
+        # timesteps
+        pipe.scheduler.set_timesteps(1000, device=self.device)
+        timestep_val = pipe.scheduler.timesteps[999 - step]
+
+        # Add noise
+        latents = pipe.scheduler.add_noise(latents, noise, timestep_val.unsqueeze(0))
+
+        # encode prompts
+        # encode_prompt returns (prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask)
+        prompt_embeds, prompt_attention_mask, _, _ = pipe.encode_prompt(
+            prompt=prompts,
+            device=self.device,
+            do_classifier_free_guidance=False
+        )
+
+        # extraction hook
+        def hook_fn(module, input, output, pos):
+            # AuraFlow transformer output might be tuple or tensor
+            if isinstance(output, tuple):
+                output = output[0]
+            representations[pos] = extract_fn(output)
+
+        # Run transformer
+        # Normalize timestep for transformer: t / 1000 (as per AuraFlow snippet)
+        timestep_norm = timestep_val / 1000
+        timestep_norm = timestep_norm.expand(latents.shape[0]).to(latents.device, dtype=latents.dtype)
+
+        with ExitStack() as stack, torch.no_grad():
+            for pos in extract_positions:
+                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
+
+            pipe.transformer(
+                latents,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep_norm,
+                return_dict=False,
+                attention_kwargs=pipe.attention_kwargs if hasattr(pipe, 'attention_kwargs') else None
+            )
+
+        # fix representation shape
+        # AuraFlow transformer output shape is likely (B, L, D). We need spatial (B, D, H, W) for SDRepresentation.
+        num_tokens = next(iter(representations.values())).shape[1]
+        potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
+        repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
+        representations = {p: r.reshape(batch_size, *repr_shape, -1).permute(0, 3, 1, 2) for p, r in representations.items()}
+
+        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
 class Kandinsky3(SDBase):
