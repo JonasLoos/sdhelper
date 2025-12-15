@@ -926,8 +926,7 @@ class AuraFlow(SDBase):
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep_val.unsqueeze(0), noise=noise)
 
         # encode prompts
-        # encode_prompt returns (prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask)
-        prompt_embeds, prompt_attention_mask, _, _ = pipe.encode_prompt(
+        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = pipe.encode_prompt(
             prompt=prompts,
             device=self.device,
             do_classifier_free_guidance=False
@@ -941,7 +940,6 @@ class AuraFlow(SDBase):
             representations[pos] = extract_fn(output)
 
         # Run transformer
-        # Normalize timestep for transformer: t / 1000 (as per AuraFlow snippet)
         timestep_norm = timestep_val / 1000
         timestep_norm = timestep_norm.expand(latents.shape[0]).to(latents.device, dtype=latents.dtype)
 
@@ -984,47 +982,22 @@ class ZImageTurbo(SDBase):
 
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
-        # ZImagePipeline uses a VAE similar to SDXL/SD3?
-        # The user snippet doesn't show encoding, but typical diffusers pipelines have VAE.
-        # Let's assume standard VAE interface: pipe.vae.encode(image).latent_dist.sample()
-        # We need to verify the VAE expected input (image processor).
-
         vae = self.pipeline.vae
         vae_dtype = next(vae.parameters()).dtype
-
-        # Z-Image likely uses standard image processor
         img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
-
-        # Standard VAE encoding
-        if hasattr(vae.config, "shift_factor"):
-            # SD3-like
-             result = (vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) - vae.config.shift_factor) * vae.config.scaling_factor
-        else:
-             # SDXL-like
-             result = vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) * vae.config.scaling_factor
-
-        # Wait, without knowing exact VAE config, it's safer to check config.
-        # However, for a "Turbo" model often used for distillation, it might be SDXL based.
-        # For now let's assume SDXL-like if no shift_factor.
-        return result
+        return (vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) - vae.config.shift_factor) * vae.config.scaling_factor
 
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
-        pipe = self.pipeline
-        vae = pipe.vae
-
-        # Check for SD3-like scaling
-        if hasattr(vae.config, "shift_factor"):
-             latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
-        else:
-             latents = latents / vae.config.scaling_factor
-
+        vae = self.pipeline.vae
+        latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
         image = vae.decode(latents, return_dict=False)[0]
-        return pipe.image_processor.postprocess(image, output_type="pil")
+        return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
+        width, height = images[0].size
 
         # encode image
         latents = self.encode_latents(images)
@@ -1051,10 +1024,7 @@ class ZImageTurbo(SDBase):
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
 
         # encode prompts
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-        ) = pipe.encode_prompt(
+        prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
             prompt=prompts,
             device=self.device,
             do_classifier_free_guidance=False,
@@ -1085,13 +1055,5 @@ class ZImageTurbo(SDBase):
                 return_dict=False
             )
 
-        # Post-process representations (reshape if sequence)
-        processed_representations = {}
-        for p, r in representations.items():
-            if len(r.shape) == 3: # (B, L, D)
-                 H_feat, W_feat = H_lat // 2, W_lat // 2
-                 if r.shape[1] == H_feat * W_feat:
-                      r = r.permute(0, 2, 1).reshape(batch_size, -1, H_feat, W_feat)
-            processed_representations[p] = r
-
-        return [SDRepresentation({p: r[i] for p, r in processed_representations.items()}, seed) for i in range(batch_size)]
+        representations = _reshape_representations_to_spatial(representations, batch_size, height, width)
+        return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]

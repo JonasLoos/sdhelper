@@ -57,7 +57,7 @@ Available models:
 * [`FLUX.2-dev`](https://huggingface.co/diffusers/FLUX.2-dev-bnb-4bit)
 * [`Playground-v2.5`](https://huggingface.co/playgroundai/playground-v2.5-1024px-aesthetic)
 * [`AuraFlow`](https://huggingface.co/fal/AuraFlow-v0.3)
-* [`Kandinsky-3`](https://huggingface.co/kandinsky-community/kandinsky-3)
+* [`ZImageTurbo`](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
 
 Especially for FLUX models, it might make sense to quantize the weights and enable CPU offloading:
 
