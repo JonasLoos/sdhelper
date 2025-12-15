@@ -907,8 +907,7 @@ class AuraFlow(SDBase):
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
         vae = self.pipeline.vae
-        vae_dtype = next(vae.parameters()).dtype
-        img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
+        img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=torch.float32)
         latents = vae.encode(img_tensor).latent_dist.sample()
         latents = latents * vae.config.scaling_factor
         return latents.to(dtype=self.dtype)
@@ -917,7 +916,7 @@ class AuraFlow(SDBase):
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
         vae = self.pipeline.vae
         latents = latents / vae.config.scaling_factor
-        image = vae.decode(latents, return_dict=False)[0]
+        image = vae.decode(latents.to(dtype=torch.float32), return_dict=False)[0]
         return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
     def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
