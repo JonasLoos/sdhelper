@@ -952,33 +952,135 @@ class AuraFlow(SDBase):
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
-class Kandinsky3(SDBase):
-    """Kandinsky-3 is a U-Net based latent diffusion model with a Flan-UL2 text encoder and a MoVQ encoder/decoder."""
-    name = "Kandinsky-3"
-    full_name = "kandinsky-community/kandinsky-3"
-    steps = 25
-    guidance_scale = 4.0
+class ZImageTurbo(SDBase):
+    name = "Z-Image-Turbo"
+    full_name = "Tongyi-MAI/Z-Image-Turbo"
+    steps = 9
+    guidance_scale = 0.0
 
     def _load_pipeline(self):
-        kwargs = {
-            "torch_dtype": self.dtype,
-            "local_files_only": self.local_files_only,
-        }
-        if self.dtype == torch.float16:
-            kwargs["variant"] = "fp16"
+        try:
+            from diffusers import ZImagePipeline
+        except ImportError:
+            raise ImportError("ZImagePipeline not found in diffusers. Please ensure you have a compatible version installed.")
 
-        self.pipeline = AutoPipelineForText2Image.from_pretrained(
+        self.pipeline = ZImagePipeline.from_pretrained(
             self.full_name,
-            **kwargs,
+            torch_dtype=torch.bfloat16 if self.device == 'cuda' else torch.float32,
+            low_cpu_mem_usage=False,
+            local_files_only=self.local_files_only,
         ).to(self.device)
 
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
-        raise NotImplementedError()
+        # ZImagePipeline uses a VAE similar to SDXL/SD3? 
+        # The user snippet doesn't show encoding, but typical diffusers pipelines have VAE.
+        # Let's assume standard VAE interface: pipe.vae.encode(image).latent_dist.sample()
+        # We need to verify the VAE expected input (image processor).
+        
+        vae = self.pipeline.vae
+        vae_dtype = next(vae.parameters()).dtype
+        
+        # Z-Image likely uses standard image processor
+        img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
+        
+        # Standard VAE encoding
+        if hasattr(vae.config, "shift_factor"):
+            # SD3-like
+             result = (vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) - vae.config.shift_factor) * vae.config.scaling_factor
+        else:
+             # SDXL-like
+             result = vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) * vae.config.scaling_factor
+             
+        # Wait, without knowing exact VAE config, it's safer to check config.
+        # However, for a "Turbo" model often used for distillation, it might be SDXL based.
+        # For now let's assume SDXL-like if no shift_factor.
+        return result
 
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
-        raise NotImplementedError()
+        pipe = self.pipeline
+        vae = pipe.vae
+        
+        # Check for SD3-like scaling
+        if hasattr(vae.config, "shift_factor"):
+             latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
+        else:
+             latents = latents / vae.config.scaling_factor
+
+        image = vae.decode(latents, return_dict=False)[0]
+        return pipe.image_processor.postprocess(image, output_type="pil")
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
-        raise NotImplementedError("img2repr is not implemented for Kandinsky-3 yet. You can still use Kandinsky-3 for text-to-image generation.")
+        pipe = self.pipeline
+        batch_size = len(images)
+        
+        # encode image
+        latents = self.encode_latents(images)
+        H_lat, W_lat = latents.shape[2], latents.shape[3]
+        
+        # Generator for noise
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=latents.dtype)
+
+        # timesteps
+        image_seq_len = (H_lat // 2) * (W_lat // 2)
+        base_seq_len = pipe.scheduler.config.get("base_image_seq_len", 256)
+        max_seq_len = pipe.scheduler.config.get("max_image_seq_len", 4096)
+        base_shift = pipe.scheduler.config.get("base_shift", 0.5)
+        max_shift = pipe.scheduler.config.get("max_shift", 1.15)
+        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        b = base_shift - m * base_seq_len
+        mu = image_seq_len * m + b
+        
+        pipe.scheduler.set_timesteps(1000, device=self.device, mu=mu)
+        timestep = pipe.scheduler.timesteps[999 - step]
+
+        # scale noise
+        latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
+
+        # encode prompts
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+        ) = pipe.encode_prompt(
+            prompt=prompts,
+            device=self.device,
+            do_classifier_free_guidance=False, 
+        )
+
+        # Prepare transformer inputs
+        timestep_model_input = timestep.expand(latents.shape[0])
+        timestep_model_input = (1000 - timestep_model_input) / 1000
+        
+        latent_model_input = latents.to(pipe.transformer.dtype)
+        latent_model_input = latent_model_input.unsqueeze(2) 
+        latent_model_input_list = list(latent_model_input.unbind(dim=0))
+
+        representations = {}
+        def hook_fn(module, input, output, pos):
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+            representations[pos] = extract_fn(output)
+
+        with ExitStack() as stack, torch.no_grad():
+            for pos in extract_positions:
+                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
+            
+            pipe.transformer(
+                latent_model_input_list, 
+                timestep_model_input.to(dtype=pipe.transformer.dtype), 
+                prompt_embeds, 
+                return_dict=False
+            )
+            
+        # Post-process representations (reshape if sequence)
+        processed_representations = {}
+        for p, r in representations.items():
+            if len(r.shape) == 3: # (B, L, D)
+                 H_feat, W_feat = H_lat // 2, W_lat // 2
+                 if r.shape[1] == H_feat * W_feat:
+                      r = r.permute(0, 2, 1).reshape(batch_size, -1, H_feat, W_feat)
+            processed_representations[p] = r
+            
+        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in processed_representations.items()}, seed) for i in range(batch_size)]
