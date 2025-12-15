@@ -43,6 +43,30 @@ def _get_all_subclasses(cls: type) -> list[type]:
     return subclasses
 
 
+def _reshape_representations_to_spatial(representations: dict[str, torch.Tensor], batch_size: int, width: int, height: int) -> dict[str, torch.Tensor]:
+    """Reshape representation tensors from sequence format to spatial format.
+
+    Converts representations from (B, L, D) to (B, 1,  D, H, W) format, where the spatial
+    dimensions (H, W) are chosen to best match the aspect ratio of the original image.
+
+    Args:
+        representations: Dictionary mapping position names to representation tensors of shape (B, L, D).
+        batch_size: Batch size.
+        width: Width of the original image.
+        height: Height of the original image.
+
+    Returns:
+        Dictionary with the same keys, but tensors reshaped to (B, 1, D, H, W) format.
+    """
+    result = {}
+    for p, r in representations.items():
+        num_tokens = r.shape[1]
+        potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
+        repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
+        result[p] = r.reshape(batch_size, 1, *repr_shape, -1).permute(0, 3, 1, 2)
+    return result
+
+
 def SD(name: str, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False) -> 'SDBase':
     """Factory function to create a Stable Diffusion model instance by name.
 
@@ -563,12 +587,9 @@ class SD3Base(SDTransformer, ABC):
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(device=self.device), encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds)
 
         # fix representation shape
-        num_tokens = next(iter(representations.values())).shape[1]
-        potential_repr_shapes = [(i, num_tokens//i) for i in range(1, num_tokens) if num_tokens % i == 0]
-        repr_shape = min(potential_repr_shapes, key=lambda x: abs(x[1]/x[0] - width / height))
-        representations = {p: r.reshape(batch_size, *repr_shape, self.latent_dim).permute(0, 3, 1, 2) for p, r in representations.items()}
+        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
-        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
+        return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
 class SD3(SD3Base):
@@ -637,12 +658,9 @@ class FLUXBase(SDTransformer, ABC):
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000, guidance=None, encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds, txt_ids=text_ids, img_ids=latent_image_ids)
 
         # fix representation shape
-        num_tokens = next(iter(representations.values())).shape[1]
-        potential_repr_shapes = [(i, num_tokens//i) for i in range(1, num_tokens) if num_tokens % i == 0]
-        repr_shape = min(potential_repr_shapes, key=lambda x: abs(x[1]/x[0] - width / height))
-        representations = {p: r.reshape(batch_size, *repr_shape, 3072).permute(0, 3, 1, 2) for p, r in representations.items()}
+        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
-        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
+        return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
 class FLUX1_dev(FLUXBase):
@@ -834,12 +852,9 @@ class FLUX2_dev(SDBase):
             )
 
         # Reshape representations to spatial format
-        num_tokens = next(iter(representations.values())).shape[1]
-        potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
-        repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
-        representations = {p: r.reshape(batch_size, *repr_shape, 6144).permute(0, 3, 1, 2) for p, r in representations.items()}
+        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
-        return [SDRepresentation({p: r[i, None] for p, r in representations.items()}, seed) for i in range(batch_size)]
+        return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
 class Playground_V2_5(SDUnet):
@@ -943,13 +958,9 @@ class AuraFlow(SDBase):
             )
 
         # fix representation shape
-        # AuraFlow transformer output shape is likely (B, L, D). We need spatial (B, D, H, W) for SDRepresentation.
-        num_tokens = next(iter(representations.values())).shape[1]
-        potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
-        repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
-        representations = {p: r.reshape(batch_size, *repr_shape, -1).permute(0, 3, 1, 2) for p, r in representations.items()}
+        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
-        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
+        return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
 
 class ZImageTurbo(SDBase):
@@ -973,17 +984,17 @@ class ZImageTurbo(SDBase):
 
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
-        # ZImagePipeline uses a VAE similar to SDXL/SD3? 
+        # ZImagePipeline uses a VAE similar to SDXL/SD3?
         # The user snippet doesn't show encoding, but typical diffusers pipelines have VAE.
         # Let's assume standard VAE interface: pipe.vae.encode(image).latent_dist.sample()
         # We need to verify the VAE expected input (image processor).
-        
+
         vae = self.pipeline.vae
         vae_dtype = next(vae.parameters()).dtype
-        
+
         # Z-Image likely uses standard image processor
         img_tensor = self.pipeline.image_processor.preprocess(images).to(device=self.device, dtype=vae_dtype)
-        
+
         # Standard VAE encoding
         if hasattr(vae.config, "shift_factor"):
             # SD3-like
@@ -991,7 +1002,7 @@ class ZImageTurbo(SDBase):
         else:
              # SDXL-like
              result = vae.encode(img_tensor).latent_dist.sample().to(dtype=self.dtype) * vae.config.scaling_factor
-             
+
         # Wait, without knowing exact VAE config, it's safer to check config.
         # However, for a "Turbo" model often used for distillation, it might be SDXL based.
         # For now let's assume SDXL-like if no shift_factor.
@@ -1001,7 +1012,7 @@ class ZImageTurbo(SDBase):
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
         pipe = self.pipeline
         vae = pipe.vae
-        
+
         # Check for SD3-like scaling
         if hasattr(vae.config, "shift_factor"):
              latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
@@ -1014,11 +1025,11 @@ class ZImageTurbo(SDBase):
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
-        
+
         # encode image
         latents = self.encode_latents(images)
         H_lat, W_lat = latents.shape[2], latents.shape[3]
-        
+
         # Generator for noise
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=latents.dtype)
@@ -1032,7 +1043,7 @@ class ZImageTurbo(SDBase):
         m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
         b = base_shift - m * base_seq_len
         mu = image_seq_len * m + b
-        
+
         pipe.scheduler.set_timesteps(1000, device=self.device, mu=mu)
         timestep = pipe.scheduler.timesteps[999 - step]
 
@@ -1046,15 +1057,15 @@ class ZImageTurbo(SDBase):
         ) = pipe.encode_prompt(
             prompt=prompts,
             device=self.device,
-            do_classifier_free_guidance=False, 
+            do_classifier_free_guidance=False,
         )
 
         # Prepare transformer inputs
         timestep_model_input = timestep.expand(latents.shape[0])
         timestep_model_input = (1000 - timestep_model_input) / 1000
-        
+
         latent_model_input = latents.to(pipe.transformer.dtype)
-        latent_model_input = latent_model_input.unsqueeze(2) 
+        latent_model_input = latent_model_input.unsqueeze(2)
         latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
         representations = {}
@@ -1066,14 +1077,14 @@ class ZImageTurbo(SDBase):
         with ExitStack() as stack, torch.no_grad():
             for pos in extract_positions:
                 stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
-            
+
             pipe.transformer(
-                latent_model_input_list, 
-                timestep_model_input.to(dtype=pipe.transformer.dtype), 
-                prompt_embeds, 
+                latent_model_input_list,
+                timestep_model_input.to(dtype=pipe.transformer.dtype),
+                prompt_embeds,
                 return_dict=False
             )
-            
+
         # Post-process representations (reshape if sequence)
         processed_representations = {}
         for p, r in representations.items():
@@ -1082,5 +1093,5 @@ class ZImageTurbo(SDBase):
                  if r.shape[1] == H_feat * W_feat:
                       r = r.permute(0, 2, 1).reshape(batch_size, -1, H_feat, W_feat)
             processed_representations[p] = r
-            
-        return [SDRepresentation({p: r[i,None,:,:,:] for p, r in processed_representations.items()}, seed) for i in range(batch_size)]
+
+        return [SDRepresentation({p: r[i] for p, r in processed_representations.items()}, seed) for i in range(batch_size)]
