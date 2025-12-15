@@ -106,7 +106,6 @@ class SDBase(ABC):
 
         # init cache variables
         self._representation_shapes = None
-        self._ddim_scheduler = None
         self._cached_prompt_embeds = {}
 
     def __call__(self, prompt: str, steps: Optional[int] = None, guidance_scale: Optional[float] = None, seed: Optional[int] = None, *, width: Optional[int] = None, height: Optional[int] = None, modification: Optional[Callable[[Any,Any,Any,str],Optional[torch.Tensor]]] = None, extract_positions: list[str] = []) -> 'SDResult':
@@ -240,12 +239,6 @@ class SDUnet(SDBase, ABC):
         '''
         return self.pipeline.numpy_to_pil(self.vae_decode(latents).clamp(0, 1).cpu().permute(0, 2, 3, 1).numpy())
 
-    @property
-    def ddim_scheduler(self):
-        if self._ddim_scheduler is None:
-            self._ddim_scheduler = DDIMScheduler.from_pretrained(self.full_name, subfolder='scheduler')
-        return self._ddim_scheduler
-
     def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification: Optional[Callable[[Any,Any,Any,str],Optional[torch.Tensor]]] = None, extract_positions: list[str] = []) -> 'SDResult':
 
         # variables to store extracted results in
@@ -312,8 +305,9 @@ class SDUnet(SDBase, ABC):
         noise = torch.randn_like(latents[None,0]).expand(latents.shape)  # expand to ensure each image is noised with the same noise/seed
 
         # apply noise
-        timestep = torch.tensor(step, dtype=torch.long, device=self.device)
-        latents = self.ddim_scheduler.add_noise(latents, noise, timestep)
+        pipe.scheduler.set_timesteps(1000, device=self.device)
+        timestep = torch.tensor([step], dtype=torch.long, device=self.device)
+        latents = pipe.scheduler.add_noise(latents, noise, timestep)
 
         # scale latents
         # TODO: this is from SD1.5 (where it's not used), is it also necessary for other models?
@@ -409,7 +403,7 @@ class SDXL(SDXLBase):
     name = 'SDXL'
     full_name = 'stabilityai/stable-diffusion-xl-base-1.0'
     steps = 40
-    guidance_scale = 5.0  # TODO: is this correct?
+    guidance_scale = 5.0
 
 
 class SDXL_Turbo(SDXLBase):
@@ -419,7 +413,7 @@ class SDXL_Turbo(SDXLBase):
     guidance_scale = 0.0
 
 
-class SDXL_Lightning_base(SDXLBase, ABC):
+class SDXL_LightningBase(SDXLBase, ABC):
     """Base class for SDXL-Lightning models."""
     guidance_scale = 0.0
 
@@ -477,25 +471,25 @@ class SDXL_Lightning_base(SDXLBase, ABC):
         self.pipeline = pipe
 
 
-class SDXL_Lightning_1step(SDXL_Lightning_base):
+class SDXL_Lightning_1step(SDXL_LightningBase):
     name = 'SDXL-Lightning-1step'
     full_name = 'ByteDance/SDXL-Lightning'
     steps = 1
 
 
-class SDXL_Lightning_2step(SDXL_Lightning_base):
+class SDXL_Lightning_2step(SDXL_LightningBase):
     name = 'SDXL-Lightning-2step'
     full_name = 'ByteDance/SDXL-Lightning'
     steps = 2
 
 
-class SDXL_Lightning_4step(SDXL_Lightning_base):
+class SDXL_Lightning_4step(SDXL_LightningBase):
     name = 'SDXL-Lightning-4step'
     full_name = 'ByteDance/SDXL-Lightning'
     steps = 4
 
 
-class SDXL_Lightning_8step(SDXL_Lightning_base):
+class SDXL_Lightning_8step(SDXL_LightningBase):
     name = 'SDXL-Lightning-8step'
     full_name = 'ByteDance/SDXL-Lightning'
     steps = 8
@@ -821,7 +815,7 @@ class FLUX2_dev(SDBase):
         guidance = torch.full([latents.shape[0]], self.guidance_scale, device=self.device, dtype=torch.bfloat16)
 
         # extraction hook
-        def hook_fn(module, input, output, pos=pos):
+        def hook_fn(module, input, output, pos):
             out = output[1] if isinstance(output, tuple) and len(output) >= 2 else (output[0] if isinstance(output, tuple) else output)
             representations[pos] = extract_fn(out)
 
