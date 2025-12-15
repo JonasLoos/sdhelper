@@ -920,6 +920,21 @@ class AuraFlow(SDBase):
         image = vae.decode(latents, return_dict=False)[0]
         return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
+    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
+        pipe = self.pipeline
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        latents = pipe(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height, generator=generator, output_type="latent").images
+        image = self.decode_latents(latents)
+        return SDResult(
+            prompt=prompt,
+            seed=seed,
+            representations=None,
+            images=None,
+            result_latent=latents,
+            result_tensor=None,
+            result_image=image,
+        )
+
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
