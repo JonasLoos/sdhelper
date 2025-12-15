@@ -23,9 +23,9 @@ def _get_module_by_path(model: Any, path: str) -> Any:
             if index:
                 current = current[int(index)]
         except AttributeError:
-            raise AttributeError(f"Extract position `{path}` not found`: Attribute `{name}` not available.")
+            raise AttributeError(f"Extract position `{path}` not found: Attribute `{name}` not available.")
         except IndexError:
-            raise IndexError(f"Extract position `{path}` not found`: Index `{index}` out of range.")
+            raise IndexError(f"Extract position `{path}` not found: Index `{index}` out of range.")
     return current
 
 
@@ -79,7 +79,7 @@ def SD(name: str, device: str = 'auto', disable_progress_bar: bool = False, loca
     return registry[target](device=device, disable_progress_bar=disable_progress_bar, local_files_only=local_files_only)
 
 
-class SDBase:
+class SDBase(ABC):
     """Base class for (Stable) Diffusion models."""
     def __init__(self, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False):
         self.local_files_only = local_files_only
@@ -259,17 +259,19 @@ class SDUnet(SDBase, ABC):
             images.extend(self.pipeline.numpy_to_pil(image))
             return callback_kwargs
 
+        # extraction hook
+        def hook_fn(module, input, output, pos):
+            if isinstance(output, tuple):
+                output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
+            representations[pos].append(output)
+            if modification:
+                return modification(module, input, output, pos)
+
         # run pipeline
         with ExitStack() as stack, torch.no_grad():
             # setup hooks to extract representations
-            for extract_position in extract_positions:
-                def get_repr(module, input, output, extract_position):
-                    if isinstance(output, tuple):
-                        output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
-                    representations[extract_position].append(output)
-                    if modification:
-                        return modification(module, input, output, extract_position)
-                stack.enter_context(_get_module_by_path(self.pipeline.unet, extract_position).register_forward_hook(partial(get_repr, extract_position=extract_position)))
+            for pos in extract_positions:
+                stack.enter_context(_get_module_by_path(self.pipeline.unet, pos).register_forward_hook(partial(hook_fn, pos=pos)))
 
             # run pipeline
             result = self.pipeline(
@@ -323,14 +325,16 @@ class SDUnet(SDBase, ABC):
         # setup unet config
         pipe.unet.config.addition_embed_type = 'nothing_at_all'
 
+        # extraction hook
+        def hook_fn(module, input, output, pos):
+            if isinstance(output, tuple):
+                output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
+            representations[pos] = extract_fn(output)
+
+        # run pipeline
         with ExitStack() as stack, torch.no_grad():
-            for extract_position in extract_positions:
-                def hook_fn(module, input, output, extract_position):
-                    # print(extract_position, print_shape(output))
-                    if isinstance(output, tuple):
-                        output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
-                    representations[extract_position] = extract_fn(output)
-                stack.enter_context(_get_module_by_path(pipe.unet, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+            for pos in extract_positions:
+                stack.enter_context(_get_module_by_path(pipe.unet, pos).register_forward_hook(partial(hook_fn, pos=pos)))
             pipe.unet(latents, timestep, encoder_hidden_states=prompt_embeds)
 
         return [SDRepresentation({p: r[i,None,:,:,:] for p, r in representations.items()}, seed) for i in range(batch_size)]
@@ -553,12 +557,14 @@ class SD3Base(SDTransformer, ABC):
         prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(prompt=prompts, prompt_2=None, prompt_3=None)  # type: ignore
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
 
-        # extract representations
+        # setup hook
+        def hook_fn(module, input, output, pos):
+            representations[pos] = extract_fn(output[1])
+
+        # run pipeline
         with ExitStack() as stack, torch.no_grad():
-            for extract_position in extract_positions:
-                def hook_fn(module, input, output, extract_position):
-                    representations[extract_position] = extract_fn(output[1])
-                stack.enter_context(_get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+            for pos in extract_positions:
+                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(device=self.device), encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds)
 
         # fix representation shape
@@ -625,12 +631,14 @@ class FLUXBase(SDTransformer, ABC):
         latents, latent_image_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, prompt_embeds.dtype, pipe.device, generator=torch.manual_seed(seed), latents=latents)
         latents = pipe._pack_latents(latents, *latents.shape)
 
-        # extract representations
+        # extraction hook
+        def hook_fn(module, input, output, pos):
+            representations[pos] = extract_fn(output)
+
+        # run pipeline
         with ExitStack() as stack, torch.no_grad():
-            for extract_position in extract_positions:
-                def hook_fn(module, input, output, extract_position):
-                    representations[extract_position] = extract_fn(output[1])
-                stack.enter_context(_get_module_by_path(pipe.transformer, extract_position).register_forward_hook(partial(hook_fn, extract_position=extract_position)))
+            for pos in extract_positions:
+                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000, guidance=None, encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds, txt_ids=text_ids, img_ids=latent_image_ids)
 
         # fix representation shape
@@ -782,7 +790,7 @@ class FLUX2_dev(SDBase):
         return float(mu)
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
-        if len(prompts) > 0:
+        if any(p != '' for p in prompts):
             raise NotImplementedError("FLUX.2 does not support prompt inputs yet")
         pipe = self.pipeline
         batch_size = len(images)
@@ -801,7 +809,8 @@ class FLUX2_dev(SDBase):
         timestep = pipe.scheduler.timesteps[999 - step]
 
         # Prepare prompt embeddings (15360 = 3 text encoder layers × 5120 hidden dim)
-        prompt_embeds = torch.randn((batch_size, 1, 15360), device=self.device, dtype=torch.bfloat16) * 0.01
+        # Use small random noise to avoid NaN values
+        prompt_embeds = torch.randn((batch_size, 1, 15360), device=self.device, dtype=torch.bfloat16, generator=torch.manual_seed(seed)) * 0.01
         txt_ids = pipe._prepare_text_ids(prompt_embeds).to(self.device)
 
         # Add noise and prepare latents for transformer
@@ -811,13 +820,15 @@ class FLUX2_dev(SDBase):
         # Prepare guidance
         guidance = torch.full([latents.shape[0]], self.guidance_scale, device=self.device, dtype=torch.bfloat16)
 
-        # Extract representations via hooks
+        # extraction hook
+        def hook_fn(module, input, output, pos=pos):
+            out = output[1] if isinstance(output, tuple) and len(output) >= 2 else (output[0] if isinstance(output, tuple) else output)
+            representations[pos] = extract_fn(out)
+
+        # run pipeline
         with ExitStack() as stack, torch.no_grad():
             for pos in extract_positions:
-                def hook_fn(module, input, output, pos=pos):
-                    out = output[1] if isinstance(output, tuple) and len(output) >= 2 else (output[0] if isinstance(output, tuple) else output)
-                    representations[pos] = extract_fn(out)
-                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(hook_fn))
+                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
             pipe.transformer(
                 hidden_states=latents,
                 timestep=(timestep / 1000).expand(latents.shape[0]).to(torch.bfloat16),
@@ -864,12 +875,20 @@ class Playground_V2_5(SDUnet):
         ).to(self.device)
 
 
-class AuraFlow(SDTransformer):
+class AuraFlow(SDBase):
     """AuraFlow v0.3 is a large rectified flow T2I model with a dedicated AuraFlowPipeline."""
     name = "AuraFlow"
     full_name = "fal/AuraFlow-v0.3"
     steps = 50
     guidance_scale = 3.5
+
+    @torch.no_grad()
+    def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @torch.no_grad()
+    def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
+        raise NotImplementedError()
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
         raise NotImplementedError("img2repr is not implemented for AuraFlow yet. You can still use AuraFlow for text-to-image generation.")
@@ -894,6 +913,14 @@ class Kandinsky3(SDBase):
             self.full_name,
             **kwargs,
         ).to(self.device)
+
+    @torch.no_grad()
+    def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @torch.no_grad()
+    def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
+        raise NotImplementedError()
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
         raise NotImplementedError("img2repr is not implemented for Kandinsky-3 yet. You can still use Kandinsky-3 for text-to-image generation.")
