@@ -923,7 +923,7 @@ class AuraFlow(SDBase):
         pipe = self.pipeline
         generator = torch.Generator(device=self.device).manual_seed(seed)
         latents = pipe(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height, generator=generator, output_type="latent").images
-        image = self.decode_latents(latents)
+        image = self.decode_latents(latents)[0]
         return SDResult(
             prompt=prompt,
             seed=seed,
