@@ -859,10 +859,7 @@ class FLUX2_dev(SDBase):
 
 class Playground_V2_5(SDUnet):
     """
-    Playground v2.5 1024px aesthetic checkpoint.
-
-    SDXL-style UNet + VAE, so we can reuse SDUnet's encode/decode/img2repr
-    path exactly like SDXL.
+    Playground v2.5 1024px aesthetic checkpoint. Uses SDXL-style UNet + VAE.
     """
     name = "Playground-v2.5"
     full_name = "playgroundai/playground-v2.5-1024px-aesthetic"
@@ -997,7 +994,7 @@ class ZImageTurbo(SDBase):
         try:
             from diffusers import ZImagePipeline
         except ImportError:
-            raise ImportError("ZImagePipeline not found in diffusers. Please ensure you have a compatible version installed.")
+            raise ImportError("Your diffusers package does not support Z-Image-Turbo, likely because it is too old. Version >= 0.36.0 is required.")
 
         self.pipeline = ZImagePipeline.from_pretrained(
             self.full_name,
@@ -1034,7 +1031,8 @@ class ZImageTurbo(SDBase):
         noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=latents.dtype)
 
         # timesteps
-        image_seq_len = (H_lat // 2) * (W_lat // 2)
+        grid_h, grid_w = H_lat // 2, W_lat // 2
+        image_seq_len = grid_h * grid_w
         base_seq_len = pipe.scheduler.config.get("base_image_seq_len", 256)
         max_seq_len = pipe.scheduler.config.get("max_image_seq_len", 4096)
         base_shift = pipe.scheduler.config.get("base_shift", 0.5)
@@ -1060,9 +1058,8 @@ class ZImageTurbo(SDBase):
 
         representations = {}
         def hook_fn(module, input, output, pos):
-            if isinstance(output, (list, tuple)):
-                output = output[0]
-            representations[pos] = extract_fn(output)
+            out = output[:,:image_seq_len,:].reshape(batch_size, 1 grid_h, grid_w, -1).permute(0, 1, 4, 2, 3)
+            representations[pos] = extract_fn(out)
 
         with ExitStack() as stack, torch.no_grad():
             for pos in extract_positions:
@@ -1075,5 +1072,4 @@ class ZImageTurbo(SDBase):
                 return_dict=False
             )
 
-        representations = _reshape_representations_to_spatial(representations, batch_size, height, width)
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
