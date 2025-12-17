@@ -1058,7 +1058,7 @@ class ZImageTurbo(SDBase):
 
         representations = {}
         def hook_fn(module, input, output, pos):
-            out = output[:,:image_seq_len,:].reshape(batch_size, 1 grid_h, grid_w, -1).permute(0, 1, 4, 2, 3)
+            out = output[:,:image_seq_len,:].reshape(batch_size, 1, grid_h, grid_w, -1).permute(0, 1, 4, 2, 3)
             representations[pos] = extract_fn(out)
 
         with ExitStack() as stack, torch.no_grad():
