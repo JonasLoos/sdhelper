@@ -43,30 +43,6 @@ def _get_all_subclasses(cls: type) -> list[type]:
     return subclasses
 
 
-def _reshape_representations_to_spatial(representations: dict[str, torch.Tensor], batch_size: int, width: int, height: int) -> dict[str, torch.Tensor]:
-    """Reshape representation tensors from sequence format to spatial format.
-
-    Converts representations from (B, L, D) to (B, 1, D, H, W) format, where the spatial
-    dimensions (H, W) are chosen to best match the aspect ratio of the original image.
-
-    Args:
-        representations: Dictionary mapping position names to representation tensors of shape (B, L, D).
-        batch_size: Batch size.
-        width: Width of the original image.
-        height: Height of the original image.
-
-    Returns:
-        Dictionary with the same keys, but tensors reshaped to (B, 1, D, H, W) format.
-    """
-    result = {}
-    for p, r in representations.items():
-        num_tokens = r.shape[1]
-        potential_shapes = [(i, num_tokens // i) for i in range(1, num_tokens + 1) if num_tokens % i == 0]
-        repr_shape = min(potential_shapes, key=lambda x: abs(x[1] / x[0] - width / height))
-        result[p] = r.reshape(batch_size, 1, *repr_shape, -1).permute(0, 1, 4, 2, 3)
-    return result
-
-
 def SD(name: str, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False) -> 'SDBase':
     """Factory function to create a Stable Diffusion model instance by name.
 
@@ -115,7 +91,6 @@ class SDBase(ABC):
         # setup pipeline
         progressbar_enabled = diffusers.utils.logging.is_progress_bar_enabled()
         if progressbar_enabled and disable_progress_bar: diffusers.utils.logging.disable_progress_bar()
-        self.pipeline: 'diffusers.StableDiffusionPipeline | diffusers.StableDiffusionXLPipeline | diffusers.StableDiffusion3Pipeline | diffusers.FluxPipeline | diffusers.Flux2Pipeline | Any'
         if hasattr(self, '_load_pipeline'):
             self._load_pipeline()
         else:
@@ -198,15 +173,15 @@ class SDBase(ABC):
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]: ...
 
     @abstractmethod
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]: ...
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]: ...
 
     @overload
-    def img2repr(self, data: PILImage | np.ndarray | str, extract_positions: list[str], step: int, prompt: str = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x.to('cpu')) -> SDRepresentation: ...
+    def img2repr(self, data: PILImage | np.ndarray | str, extract_positions: list[str], step: int, prompt: str = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x.to('cpu'), raw: bool = False) -> SDRepresentation: ...
 
     @overload
-    def img2repr(self, data: list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x.to('cpu')) -> list[SDRepresentation]: ...
+    def img2repr(self, data: list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x.to('cpu'), raw: bool = False) -> list[SDRepresentation]: ...
 
-    def img2repr(self, data: PILImage | np.ndarray | str | list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x.to('cpu')):
+    def img2repr(self, data: PILImage | np.ndarray | str | list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x.to('cpu'), raw: bool = False):
         '''Convert image to representations at specified extract positions.
 
         Args:
@@ -214,10 +189,10 @@ class SDBase(ABC):
             extract_positions: List of extract positions to return representations for.
             step: Timestep determining the amount of noise to add. Noise increases with timestep. Must be in [0, 999]. Even step 0 might add noise, depending on the scheduler.
             prompt: Prompt to use for the image. If a list is provided, each image will be paired with the corresponding prompt.
-            spatial_avg: If True, spatially average the representations.
-            output_device: Device to move the representations to.
             batch_size: Number of images to process at once. The returned representations might differ slightly depending on the batch size. For best reproducability, set batch_size=1.
             seed: Seed for random number generation. If None, a random seed will be used.
+            extract_fn: Function to apply to the representations. By default, the representations are moved to the CPU.
+            raw: If True, return the raw representations without any processing like reshaping. This is applied before extract_fn.
 
         Returns:
             Dictionary with extract positions as keys and the corresponding representations as values.
@@ -255,7 +230,7 @@ class SDBase(ABC):
         representations = []
         for i in trange(0, len(images_rgb), batch_size, desc='Extracting representations for list of images', disable=single or self.disable_progress_bar):
             torch.manual_seed(seed)
-            representations.extend(self._img2repr(images_rgb[i:i+batch_size], extract_positions, step, prompt[i:i+batch_size], seed, extract_fn))
+            representations.extend(self._img2repr(images_rgb[i:i+batch_size], extract_positions, step, prompt[i:i+batch_size], seed, extract_fn, raw))
         return representations[0] if single else representations
 
 
@@ -334,7 +309,7 @@ class SDUnet(SDBase, ABC):
         )
 
     @torch.no_grad()
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool = False) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
         representations = {}
@@ -353,15 +328,13 @@ class SDUnet(SDBase, ABC):
         latents = pipe.scheduler.scale_model_input(latents, timestep)
 
         # create empty prompt embeddings
-        prompt_embeds, *_ = self.pipeline.encode_prompt(prompt=prompts, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False)  # type: ignore
+        prompt_embeds, *_ = self.pipeline.encode_prompt(prompt=prompts, device=self.device, num_images_per_prompt=1, do_classifier_free_guidance=False)
 
         # setup unet config
         pipe.unet.config.addition_embed_type = 'nothing_at_all'
 
         # extraction hook
         def hook_fn(module, input, output, pos):
-            if isinstance(output, tuple):
-                output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
             representations[pos] = extract_fn(output)
 
         # run pipeline
@@ -411,14 +384,14 @@ class SD1_5(SDUnet):
 
 class SD2_0(SDUnet):
     name = 'SD2.0'
-    full_name = 'stabilityai/stable-diffusion-2'
+    full_name = 'sd-research/stable-diffusion-2-base'
     steps = 50
     guidance_scale = 7.5
 
 
 class SD2_1(SDUnet):
     name = 'SD2.1'
-    full_name = 'stabilityai/stable-diffusion-2-1'
+    full_name = 'sd-research/stable-diffusion-2-1-base'
     steps = 50
     guidance_scale = 7.5
 
@@ -552,42 +525,40 @@ class SDTransformer(SDBase, ABC):
             latents: The latents to decode.
         '''
         pipe = self.pipeline
-        tmp = pipe.vae.decode((latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor, return_dict=False)
-        return pipe.image_processor.postprocess(tmp)  # type: ignore
+        output_tensor = pipe.vae.decode((latents / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor, return_dict=False)[0]
+        return pipe.image_processor.postprocess(output_tensor)
 
 
 class SD3Base(SDTransformer, ABC):
     """Base class for SD3 models."""
-    latent_dim = 1536
 
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
 
         pipe = self.pipeline
         batch_size = len(images)
-        width, height = images[0].size
         representations = {}
 
         # encode image
         latents = self.encode_latents(images)  # this gives slightly different results for different batch sizes
+        h_lat, w_lat = latents.shape[2], latents.shape[3]
         noise = torch.randn_like(latents[None,0]).expand(latents.shape)  # expand to ensure each image is noised with the same noise/seed
 
         pipe.scheduler.set_timesteps(1000, device=self.device)
         timestep = pipe.scheduler.timesteps[999 - step]
-        prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(prompt=prompts, prompt_2=None, prompt_3=None)  # type: ignore
+        prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(prompt=prompts, prompt_2=None, prompt_3=None)
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
 
         # setup hook
         def hook_fn(module, input, output, pos):
-            representations[pos] = extract_fn(output[1])
+            if not raw:
+                output = output[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+            representations[pos] = extract_fn(output)
 
         # run pipeline
         with ExitStack() as stack, torch.no_grad():
             for pos in extract_positions:
                 stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(device=self.device), encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds)
-
-        # fix representation shape
-        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
@@ -597,7 +568,6 @@ class SD3(SD3Base):
     full_name = 'stabilityai/stable-diffusion-3-medium-diffusers'
     steps = 28
     guidance_scale = 7.0
-    latent_dim = 1536
 
 
 class SD3_5_Large(SD3Base):
@@ -605,7 +575,6 @@ class SD3_5_Large(SD3Base):
     full_name = 'stabilityai/stable-diffusion-3.5-large'
     steps = 28
     guidance_scale = 3.5
-    latent_dim = 2432
 
 
 class SD3_5_Medium(SD3Base):
@@ -613,7 +582,6 @@ class SD3_5_Medium(SD3Base):
     full_name = 'stabilityai/stable-diffusion-3.5-medium'
     steps = 28
     guidance_scale = 3.5
-    latent_dim = 2432
 
 
 class SD3_5_Large_Turbo(SD3Base):
@@ -621,12 +589,11 @@ class SD3_5_Large_Turbo(SD3Base):
     full_name = 'stabilityai/stable-diffusion-3.5-large-turbo'
     steps = 4
     guidance_scale = 1.0
-    latent_dim = 2432
 
 
 class FLUXBase(SDTransformer, ABC):
     """Base class for FLUX models."""
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
         width, height = images[0].size
@@ -634,6 +601,7 @@ class FLUXBase(SDTransformer, ABC):
 
         # encode image
         latents = self.encode_latents(images)
+        h_lat, w_lat = latents.shape[2], latents.shape[3]
         noise = torch.randn_like(latents[None,0]).expand(latents.shape)  # expand to ensure each image is noised with the same noise/seed
 
         # timestep
@@ -643,12 +611,15 @@ class FLUXBase(SDTransformer, ABC):
 
         # prepare and noise latents
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
-        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(prompt=prompts, prompt_2=None)  # type: ignore
-        latents, latent_image_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, prompt_embeds.dtype, pipe.device, generator=torch.manual_seed(seed), latents=latents)
+        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(prompt=prompts, prompt_2=None)
+        generator = torch.Generator(device=pipe.device).manual_seed(seed)
+        latents, latent_image_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, prompt_embeds.dtype, pipe.device, generator=generator, latents=latents)
         latents = pipe._pack_latents(latents, *latents.shape)
 
         # extraction hook
         def hook_fn(module, input, output, pos):
+            if not raw:
+                output = output[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
             representations[pos] = extract_fn(output)
 
         # run pipeline
@@ -656,9 +627,6 @@ class FLUXBase(SDTransformer, ABC):
             for pos in extract_positions:
                 stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000, guidance=None, encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds, txt_ids=text_ids, img_ids=latent_image_ids)
-
-        # fix representation shape
-        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
@@ -802,7 +770,7 @@ class FLUX2_dev(SDBase):
 
         return float(mu)
 
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
         if any(p != '' for p in prompts):
             raise NotImplementedError("FLUX.2 does not support prompt inputs yet")
         pipe = self.pipeline
@@ -812,12 +780,12 @@ class FLUX2_dev(SDBase):
 
         # Encode image to latents
         latents = self.encode_latents(images)
+        _, _, h_lat, w_lat = latents.shape
         noise = torch.randn_like(latents[None, 0]).expand(latents.shape)
 
         # Setup scheduler with dynamic shifting
-        _, _, latent_h, latent_w = latents.shape
         num_steps = 1000
-        mu = self._compute_empirical_mu(latent_h * latent_w, num_steps)
+        mu = self._compute_empirical_mu(h_lat * w_lat, num_steps)
         pipe.scheduler.set_timesteps(num_steps, device=self.device, mu=mu)
         timestep = pipe.scheduler.timesteps[999 - step]
 
@@ -835,8 +803,9 @@ class FLUX2_dev(SDBase):
 
         # extraction hook
         def hook_fn(module, input, output, pos):
-            out = output[1] if isinstance(output, tuple) and len(output) >= 2 else (output[0] if isinstance(output, tuple) else output)
-            representations[pos] = extract_fn(out)
+            if not raw:
+                output = output.permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+            representations[pos] = extract_fn(output)
 
         # run pipeline
         with ExitStack() as stack, torch.no_grad():
@@ -850,9 +819,6 @@ class FLUX2_dev(SDBase):
                 txt_ids=txt_ids,
                 img_ids=img_ids,
             )
-
-        # Reshape representations to spatial format
-        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
@@ -928,14 +894,14 @@ class AuraFlow(SDBase):
             result_image=image,
         )
 
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
-        width, height = images[0].size
         representations = {}
 
         # encode image
         latents = self.encode_latents(images)
+        _, _, h_lat, w_lat = latents.shape
         noise = torch.randn_like(latents[None,0]).expand(latents.shape)
 
         # timesteps
@@ -954,9 +920,9 @@ class AuraFlow(SDBase):
 
         # extraction hook
         def hook_fn(module, input, output, pos):
-            # AuraFlow transformer output might be tuple or tensor
-            if isinstance(output, tuple):
-                output = output[0]
+            if not raw:
+                # cut and reshape output to spatial format
+                output = output[:,:(h_lat*w_lat//4),:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
             representations[pos] = extract_fn(output)
 
         # Run transformer
@@ -974,9 +940,6 @@ class AuraFlow(SDBase):
                 return_dict=False,
                 attention_kwargs=pipe.attention_kwargs if hasattr(pipe, 'attention_kwargs') else None
             )
-
-        # fix representation shape
-        representations = _reshape_representations_to_spatial(representations, batch_size, width, height)
 
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
@@ -1010,26 +973,25 @@ class ZImageTurbo(SDBase):
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
         vae = self.pipeline.vae
-        latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
+        vae_dtype = next(vae.parameters()).dtype
+        latents = (latents.to(dtype=vae_dtype) / vae.config.scaling_factor) + vae.config.shift_factor
         image = vae.decode(latents, return_dict=False)[0]
         return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
         pipe = self.pipeline
         batch_size = len(images)
-        width, height = images[0].size
 
         # encode image
         latents = self.encode_latents(images)
-        H_lat, W_lat = latents.shape[2], latents.shape[3]
+        _, _, h_lat, w_lat = latents.shape
 
         # Generator for noise
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=latents.dtype)
 
         # timesteps
-        grid_h, grid_w = H_lat // 2, W_lat // 2
-        image_seq_len = grid_h * grid_w
+        image_seq_len = h_lat * w_lat // 4
         base_seq_len = pipe.scheduler.config.get("base_image_seq_len", 256)
         max_seq_len = pipe.scheduler.config.get("max_image_seq_len", 4096)
         base_shift = pipe.scheduler.config.get("base_shift", 0.5)
@@ -1055,8 +1017,10 @@ class ZImageTurbo(SDBase):
 
         representations = {}
         def hook_fn(module, input, output, pos):
-            out = output[:,:image_seq_len,:].reshape(batch_size, 1, grid_h, grid_w, -1).permute(0, 1, 4, 2, 3)
-            representations[pos] = extract_fn(out)
+            print(output)
+            if not raw:
+                output = output[:,:image_seq_len,:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+            representations[pos] = extract_fn(output)
 
         with ExitStack() as stack, torch.no_grad():
             for pos in extract_positions:
@@ -1098,7 +1062,7 @@ class QwenImage(SDBase):
     def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
         pipe = self.pipeline
         generator = torch.Generator(device=self.device).manual_seed(seed)
-        image = pipe(prompt, num_inference_steps=steps, true_cfg_scale=guidance_scale, width=width, height=height, generator=generator, output_type="latent").images
+        image = pipe(prompt, num_inference_steps=steps, true_cfg_scale=guidance_scale, width=width, height=height, generator=generator, output_type="pil").images[0]
         return SDResult(
             prompt=prompt,
             seed=seed,
@@ -1109,7 +1073,7 @@ class QwenImage(SDBase):
             result_image=image,
         )
 
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
         raise NotImplementedError("QwenImage does not support extracting representations")
 
 
