@@ -1,7 +1,7 @@
 from contextlib import ExitStack
 from functools import partial
 import diffusers
-from diffusers import AutoPipelineForText2Image, DDIMScheduler
+from diffusers import AutoPipelineForText2Image
 import torch
 import numpy as np
 from typing import Optional, Callable, Any, overload
@@ -869,17 +869,14 @@ class Playground_V2_5(SDUnet):
     def _load_pipeline(self):
         from diffusers import StableDiffusionXLPipeline
 
-        kwargs = {
-            "torch_dtype": self.dtype,
-            "local_files_only": self.local_files_only,
-        }
-        if self.dtype == torch.float16:
-            kwargs["variant"] = "fp16"
-
         self.pipeline = StableDiffusionXLPipeline.from_pretrained(
             self.full_name,
-            **kwargs,
+            torch_dtype=self.dtype,
+            local_files_only=self.local_files_only,
         ).to(self.device)
+
+        # upcast vae to float32 to avoid precision issues
+        self.pipeline.vae.to(dtype=torch.float32)
 
 
 class AuraFlow(SDBase):
@@ -1073,3 +1070,50 @@ class ZImageTurbo(SDBase):
             )
 
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
+
+
+class QwenImage(SDBase):
+    name = "QwenImage"
+    full_name = "Qwen/Qwen-Image"
+    steps = 50
+    guidance_scale = 4.0
+
+    def _load_pipeline(self):
+        from diffusers import DiffusionPipeline
+
+        self.pipeline = DiffusionPipeline.from_pretrained(
+            self.full_name,
+            torch_dtype=torch.bfloat16 if self.device == 'cuda' else torch.float32,
+            local_files_only=self.local_files_only,
+        ).to(self.device)
+
+    @torch.no_grad()
+    def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
+        raise NotImplementedError("QwenImage does not support encoding latents")
+
+    @torch.no_grad()
+    def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
+        raise NotImplementedError("QwenImage does not support decoding latents")
+
+    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
+        pipe = self.pipeline
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        image = pipe(prompt, num_inference_steps=steps, true_cfg_scale=guidance_scale, width=width, height=height, generator=generator, output_type="latent").images
+        return SDResult(
+            prompt=prompt,
+            seed=seed,
+            representations=None,
+            images=None,
+            result_latent=None,
+            result_tensor=None,
+            result_image=image,
+        )
+
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor]) -> list[SDRepresentation]:
+        raise NotImplementedError("QwenImage does not support extracting representations")
+
+
+# Potential models to add:
+# - stabilityai/stable-cascade
+# - tencent/HunyuanImage-3.0
+# - ...
