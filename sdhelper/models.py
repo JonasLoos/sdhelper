@@ -750,6 +750,9 @@ class FLUX2_dev(SDBase):
         # Postprocess to PIL images
         return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
+    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
+        raise NotImplementedError("Flux.2-dev currently does not support image generation, as the text encoder is not automatically loaded. You can use `FLUX2_dev().pipeline(...)` instead.")
+
     @staticmethod
     def _compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
         """Compute mu for dynamic shifting scheduler (from Flux2Pipeline)."""
@@ -791,12 +794,13 @@ class FLUX2_dev(SDBase):
 
         # Prepare prompt embeddings (15360 = 3 text encoder layers × 5120 hidden dim)
         # Use small random noise to avoid NaN values
-        prompt_embeds = torch.randn((batch_size, 1, 15360), device=self.device, dtype=torch.bfloat16, generator=torch.manual_seed(seed)) * 0.01
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        prompt_embeds = torch.randn((batch_size, 1, 15360), device=self.device, dtype=torch.bfloat16, generator=generator) * 0.01
         txt_ids = pipe._prepare_text_ids(prompt_embeds).to(self.device)
 
         # Add noise and prepare latents for transformer
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0).unsqueeze(0), noise=noise)
-        latents, img_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, torch.bfloat16, self.device, generator=torch.manual_seed(seed), latents=latents)
+        latents, img_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, torch.bfloat16, self.device, generator=generator, latents=latents)
 
         # Prepare guidance
         guidance = torch.full([latents.shape[0]], self.guidance_scale, device=self.device, dtype=torch.bfloat16)
@@ -1017,7 +1021,6 @@ class ZImageTurbo(SDBase):
 
         representations = {}
         def hook_fn(module, input, output, pos):
-            print(output)
             if not raw:
                 output = output[:,:image_seq_len,:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
             representations[pos] = extract_fn(output)
