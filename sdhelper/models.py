@@ -606,10 +606,9 @@ class FLUXBase(SDTransformer, ABC):
 
         # timesteps / dynamic shifting
         cfg = pipe.scheduler.config
-        use_dynamic = bool(cfg.get("use_dynamic_shifting", False))
 
         set_kwargs = {}
-        if use_dynamic:
+        if bool(cfg.get("use_dynamic_shifting", False)):
             # diffusers.pipelines.flux.pipeline_flux.calculate_shift
             # image_seq_len is the packed latent sequence length used by Flux (2x2 packing => //4)
             image_seq_len = (h_lat * w_lat) // 4
@@ -637,11 +636,22 @@ class FLUXBase(SDTransformer, ABC):
                 output = output[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
             representations[pos] = extract_fn(output)
 
+        # Prepare guidance if required (for FLUX.1-dev and FLUX.1-Krea)
+        guidance = torch.full([latents.shape[0]], self.guidance_scale * 1000.0, device=pipe.device, dtype=latents.dtype) if pipe.transformer.config.guidance_embeds else None
+
         # run pipeline
         with ExitStack() as stack, torch.no_grad():
             for pos in extract_positions:
                 stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
-            pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000, guidance=None, encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds, txt_ids=text_ids, img_ids=latent_image_ids)
+            pipe.transformer(
+                hidden_states=latents,
+                timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000,
+                guidance=guidance,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids
+            )
 
         return [SDRepresentation({p: r[i] for p, r in representations.items()}, seed) for i in range(batch_size)]
 
@@ -860,9 +870,26 @@ class Playground_V2_5(SDUnet):
             local_files_only=self.local_files_only,
         ).to(self.device)
 
-        # upcast vae to float32 to avoid precision issues
-        self.pipeline.vae.to(dtype=torch.float32)
-
+    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
+        # The standard unet `_generate` method leads to grayish images, so we just use the pipeline directly.
+        result = self.pipeline(
+            prompt=prompt,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            width=width,
+            height=height,
+            generator=torch.Generator(device=self.device).manual_seed(seed),
+            output_type="pil",
+        )
+        return SDResult(
+            prompt=prompt,
+            seed=seed,
+            representations=None,
+            images=None,
+            result_latent=None,
+            result_tensor=None,
+            result_image=result.images[0],
+        )
 
 class AuraFlow(SDBase):
     """AuraFlow v0.3 is a large rectified flow T2I model with a dedicated AuraFlowPipeline."""

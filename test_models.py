@@ -13,7 +13,8 @@ test_dir.mkdir(parents=True, exist_ok=True)
 
 all_models = [cls for cls in sdhelper.models._get_all_subclasses(sdhelper.models.SDBase) if hasattr(cls, 'name') and isinstance(cls.name, str) and 'base' not in cls.name.lower()]
 # all_models = [sdhelper.models.AuraFlow, sdhelper.models.Playground_V2_5]
-all_models = [cls for cls in all_models if not issubclass(cls, sdhelper.models.SDUnet)]
+# all_models = [cls for cls in all_models if not issubclass(cls, sdhelper.models.SDUnet)]
+# all_models = [sdhelper.models.FLUX1_dev, sdhelper.models.FLUX1_schnell, sdhelper.models.FLUX1_Krea]
 
 print(all_models)
 
@@ -80,7 +81,7 @@ try:
                 r = f.img2repr('sample.jpg', [get_extract_position(f)], 100)
                 sim = r.cosine_similarity(r)
                 n = sim.shape[0]
-                sim = sim.cpu().numpy()[n//2,n//2,:,:]
+                sim = sim.cpu().numpy()[n//2,n//2,:,:]/2 + 0.5
                 sim_img = PIL.Image.fromarray((sim*255).astype(np.uint8))
                 sim_img.save(dir / 'similarity.jpg')
                 sim_normalized = (sim - sim.min()) / (sim.max() - sim.min())
