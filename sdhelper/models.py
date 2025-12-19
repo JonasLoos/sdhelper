@@ -1090,24 +1090,101 @@ class QwenImage(SDBase):
     def _load_pipeline(self):
         from diffusers import DiffusionPipeline
 
+        # Qwen-Image examples use bfloat16 on CUDA
+        self.dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
         self.pipeline = DiffusionPipeline.from_pretrained(
             self.full_name,
-            torch_dtype=torch.bfloat16 if self.device == 'cuda' else torch.float32,
+            torch_dtype=self.dtype,
             local_files_only=self.local_files_only,
         ).to(self.device)
 
+        # helpful for big images
+        if hasattr(self.pipeline, "vae") and hasattr(self.pipeline.vae, "enable_tiling"):
+            self.pipeline.vae.enable_tiling()
+
+    def _vae_stats(self):
+        # Qwen VAE uses per-channel mean/std
+        vae = self.pipeline.vae
+        mean = getattr(vae.config, "latents_mean", None)
+        std = getattr(vae.config, "latents_std", None)
+        if mean is None or std is None:
+            return None, None
+        mean = torch.tensor(mean, device=self.device, dtype=torch.float32).view(1, -1, 1, 1)
+        std = torch.tensor(std, device=self.device, dtype=torch.float32).view(1, -1, 1, 1)
+        return mean, std
+
     @torch.no_grad()
     def encode_latents(self, images: list[PILImage]) -> torch.Tensor:
-        raise NotImplementedError("QwenImage does not support encoding latents")
+        pipe = self.pipeline
+        vae = pipe.vae
+
+        # VAE
+        x = pipe.image_processor.preprocess(images).to(device=self.device, dtype=torch.float32)
+        z = vae.tiled_encode(x)
+        mean, std = self._vae_stats()
+        if mean is not None:
+            z = (z - mean) / std
+
+        return z.to(dtype=self.dtype)
 
     @torch.no_grad()
     def decode_latents(self, latents: torch.Tensor) -> list[PILImage]:
-        raise NotImplementedError("QwenImage does not support decoding latents")
-
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
         pipe = self.pipeline
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        image = pipe(prompt, num_inference_steps=steps, true_cfg_scale=guidance_scale, width=width, height=height, generator=generator, output_type="pil").images[0]
+        vae = pipe.vae
+
+        z = latents.to(device=self.device, dtype=torch.float32)
+        mean, std = self._vae_stats()
+        if mean is not None:
+            z = z * std + mean
+
+        if hasattr(vae, "tiled_decode"):
+            x = vae.tiled_decode(z).sample
+        else:
+            out = vae.decode(z, return_dict=True)
+            x = out.sample if hasattr(out, "sample") else out[0]
+
+        return pipe.image_processor.postprocess(x, output_type="pil")
+
+    @staticmethod
+    def _pack_latents_2x2(latents: torch.Tensor) -> torch.Tensor:
+        # packing: patch_size=2 => 2x2 pack, channels *= 4, spatial //= 2
+        # (B, C, H, W) -> (B, (H//2)*(W//2), C*4)
+        b, c, h, w = latents.shape
+        lat = latents.view(b, c, h // 2, 2, w // 2, 2)
+        lat = lat.permute(0, 2, 4, 1, 3, 5).contiguous()  # (B, H//2, W//2, C, 2, 2)
+        lat = lat.view(b, (h // 2) * (w // 2), c * 4)
+        return lat
+
+    @staticmethod
+    def _unpack_latents_2x2(packed: torch.Tensor, h_lat: int, w_lat: int, c: int) -> torch.Tensor:
+        # (B, (H//2)*(W//2), C*4) -> (B, C, H, W)
+        b, seq, c4 = packed.shape
+        assert c4 == c * 4
+        lat = packed.view(b, h_lat // 2, w_lat // 2, c, 2, 2)
+        lat = lat.permute(0, 3, 1, 4, 2, 5).contiguous()
+        lat = lat.view(b, c, h_lat, w_lat)
+        return lat
+
+    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *,
+                  width: Optional[int] = None, height: Optional[int] = None,
+                  modification=None, extract_positions: list[str] = []) -> "SDResult":
+        if modification is not None or extract_positions:
+            raise ValueError("QwenImage: modifications/extract_positions during generation not implemented.")
+
+        pipe = self.pipeline
+        g = torch.Generator(device=self.device).manual_seed(seed)
+
+        out = pipe(
+            prompt=prompt,
+            negative_prompt="",
+            true_cfg_scale=guidance_scale,
+            num_inference_steps=int(steps),
+            width=width,
+            height=height,
+            generator=g,
+            output_type="pil",
+        )
+
         return SDResult(
             prompt=prompt,
             seed=seed,
@@ -1115,11 +1192,84 @@ class QwenImage(SDBase):
             images=None,
             result_latent=None,
             result_tensor=None,
-            result_image=image,
+            result_image=out.images[0],
         )
 
-    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> list[SDRepresentation]:
-        raise NotImplementedError("QwenImage does not support extracting representations")
+    def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int,
+                  prompts: list[str], seed: int,
+                  extract_fn: Callable[[torch.Tensor], torch.Tensor],
+                  raw: bool) -> list["SDRepresentation"]:
+        pipe = self.pipeline
+        batch_size = len(images)
+
+        # encode -> (B, C, H, W)
+        latents = self.encode_latents(images)
+        b, c, h_lat, w_lat = latents.shape
+
+        gen = torch.Generator(device=self.device).manual_seed(seed)
+        noise = torch.randn(latents.shape, generator=gen, device=self.device, dtype=latents.dtype)
+
+        # scheduler timestep selection (train-time grid of 1000)
+        cfg = pipe.scheduler.config
+        set_kwargs = {}
+        if bool(cfg.get("use_dynamic_shifting", False)):
+            # same dynamic-shift idea used across FlowMatch schedulers: shift depends on image sequence length
+            image_seq_len = (h_lat * w_lat) // 4
+            base_seq_len = cfg.get("base_image_seq_len", 256)
+            max_seq_len = cfg.get("max_image_seq_len", 8192)
+            base_shift = cfg.get("base_shift", 0.5)
+            max_shift = cfg.get("max_shift", 1.15)
+            m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+            b0 = base_shift - m * base_seq_len
+            set_kwargs["mu"] = float(image_seq_len * m + b0)
+
+        pipe.scheduler.set_timesteps(1000, device=self.device, **set_kwargs)
+        timestep = pipe.scheduler.timesteps[999 - step]
+
+        noised = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
+
+        # pack for transformer: (B, seq, in_channels)
+        packed = self._pack_latents_2x2(noised).to(dtype=self.dtype)
+
+        # prompt encoding
+        prompt_embeds, prompt_mask = pipe.encode_prompt(prompts, device=self.device)
+        # transformer expects timestep as LongTensor (per docs)  [oai_citation:5‡Hugging Face](https://huggingface.co/docs/diffusers/main/api/models/qwenimage_transformer2d)
+        t_in = timestep.expand(batch_size).to(device=self.device)
+        if t_in.dtype != torch.long:
+            t_in = t_in.to(torch.long)
+
+        # capture hooks
+        representations: dict[str, torch.Tensor] = {}
+        def hook_fn(_module, _inp, output, pos: str):
+            print(output)
+            print(type(output))
+            print(output[0].shape)
+            print(output[1].shape)
+            if not raw:
+                output = output[1].permute(0, 2, 1).contiguous().view(batch_size, 1, -1, h_lat // 2, w_lat // 2)
+            representations[pos] = extract_fn(output)
+
+        with ExitStack() as stack:
+            for pos in extract_positions:
+                stack.enter_context(
+                    _get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos))
+                )
+
+            pipe.transformer(
+                hidden_states=packed,
+                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states_mask=prompt_mask,
+                timestep=t_in,
+                img_shapes=[(1, h_lat // 2, w_lat // 2)] * batch_size,
+                txt_seq_lens=txt_seq_lens,
+                guidance=None,
+                return_dict=False,
+            )
+
+        return [
+            SDRepresentation({p: representations[p][i] for p in representations.keys()}, seed)
+            for i in range(batch_size)
+        ]
 
 
 # Potential models to add:
