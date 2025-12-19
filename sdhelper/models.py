@@ -604,10 +604,25 @@ class FLUXBase(SDTransformer, ABC):
         h_lat, w_lat = latents.shape[2], latents.shape[3]
         noise = torch.randn_like(latents[None,0]).expand(latents.shape)  # expand to ensure each image is noised with the same noise/seed
 
-        # timestep
-        pipe.scheduler.set_timesteps(1000, device=pipe.device)
-        # We skip all the scheduler timestep calculation, as it seems to just result in `step`. So we just use this directly. +1 because the timesteps are 0-indexed.
-        timestep = torch.tensor([step], device=pipe.device) + 1
+        # timesteps / dynamic shifting
+        cfg = pipe.scheduler.config
+        use_dynamic = bool(cfg.get("use_dynamic_shifting", False))
+
+        set_kwargs = {}
+        if use_dynamic:
+            # diffusers.pipelines.flux.pipeline_flux.calculate_shift
+            # image_seq_len is the packed latent sequence length used by Flux (2x2 packing => //4)
+            image_seq_len = (h_lat * w_lat) // 4
+            base_seq_len = cfg.get("base_image_seq_len", 256)
+            max_seq_len  = cfg.get("max_image_seq_len", 4096)
+            base_shift   = cfg.get("base_shift", 0.5)
+            max_shift    = cfg.get("max_shift", 1.16)
+            m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+            b = base_shift - m * base_seq_len
+            mu = image_seq_len * m + b
+            set_kwargs["mu"] = float(mu)
+        pipe.scheduler.set_timesteps(1000, device=pipe.device, **set_kwargs)
+        timestep = pipe.scheduler.timesteps[999 - step]
 
         # prepare and noise latents
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
