@@ -831,7 +831,7 @@ class FLUX2_dev(SDBase):
         guidance = torch.full([latents.shape[0]], self.guidance_scale, device=self.device, dtype=torch.bfloat16)
 
         # extraction hook
-        def hook_fn(module, input, output, pos):
+        def hook_fn(_module, _input, output, pos):
             if not raw:
                 output = output.permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
             representations[pos] = extract_fn(output)
@@ -1233,10 +1233,8 @@ class QwenImage(SDBase):
 
         # prompt encoding
         prompt_embeds, prompt_mask = pipe.encode_prompt(prompts, device=self.device)
-        # transformer expects timestep as LongTensor (per docs)  [oai_citation:5‡Hugging Face](https://huggingface.co/docs/diffusers/main/api/models/qwenimage_transformer2d)
-        t_in = timestep.expand(batch_size).to(device=self.device)
-        if t_in.dtype != torch.long:
-            t_in = t_in.to(torch.long)
+        txt_seq_lens = prompt_mask.to(torch.long).sum(dim=1).tolist()
+        t_in = timestep.expand(batch_size).to(device=self.device, dtype=torch.long)
 
         # capture hooks
         representations: dict[str, torch.Tensor] = {}
