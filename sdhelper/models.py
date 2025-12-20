@@ -42,6 +42,44 @@ def _get_all_subclasses(cls: type) -> list[type]:
         subclasses.extend(_get_all_subclasses(subclass))
     return subclasses
 
+class _ApplyModelHooks:
+    """Helper class for applying hooks for representation extraction. Additionally, if raw is False, the given transforms are applied and the output is moved to the cpu. Finally the extract function is applied."""
+    def __init__(self, model, extract_positions: list[str], extract_fn: Callable[[torch.Tensor], torch.Tensor], raw: bool, transforms: dict[str, Callable] = {}):
+        self.model = model
+        self.extract_positions = extract_positions
+        self.extract_fn = extract_fn
+        self.raw = raw
+        self.transforms = transforms
+        self.exit_stack = contextlib.ExitStack()
+        self.hooks = []
+
+    def _hook_fn(self, _module, _input, output, pos: str):
+        if not self.raw:
+            # apply transforms
+            for mod, fn in self.transforms.items():
+                if re.match(mod[0], pos):
+                    try:
+                        output = fn(output)
+                    except Exception as e:
+                        print(f"Error applying transform to {pos}: {e}")
+            # try to move to cpu
+            if isinstance(output, torch.Tensor):
+                output = output.to("cpu")
+            elif isinstance(output, tuple):
+                output = tuple(o.to("cpu") for o in output)
+        self.hooks.append(self.extract_fn(output))
+
+    def __enter__(self):
+        self.exit_stack.__enter__()
+        # register hooks for all extract positions
+        for pos in self.extract_positions:
+            m = _get_module_by_path(self.model, pos)
+            self.exit_stack.enter_context(m.register_forward_hook(partial(self._hook_fn, pos)))
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.exit_stack.__exit__(exc_type, exc_value, traceback)
+
 
 def SD(name: str, device: str = 'auto', disable_progress_bar: bool = False, local_files_only: bool = False) -> 'SDBase':
     """Factory function to create a Stable Diffusion model instance by name.
@@ -315,7 +353,6 @@ class SDUnet(SDBase, ABC):
     @torch.no_grad()
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool = False) -> dict[str, Any]:
         pipe = self.pipeline
-        representations = {}
 
         # encode image
         latents = self.encode_latents(images)  # this gives slightly different results for different batch sizes
@@ -336,19 +373,11 @@ class SDUnet(SDBase, ABC):
         # setup unet config
         pipe.unet.config.addition_embed_type = 'nothing_at_all'
 
-        # extraction hook
-        def hook_fn(_module, _input, output, pos):
-            if not raw:
-                output = output.to('cpu')
-            representations[pos] = extract_fn(output)
-
         # run pipeline
-        with ExitStack() as stack, torch.no_grad():
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(pipe.unet, pos).register_forward_hook(partial(hook_fn, pos=pos)))
+        with _ApplyModelHooks(pipe.unet, extract_positions, extract_fn, raw) as hooks, torch.no_grad():
             pipe.unet(latents, timestep, encoder_hidden_states=prompt_embeds)
 
-        return representations
+        return hooks.representations
 
 
 class SD1_1(SDUnet):
@@ -541,7 +570,6 @@ class SD3Base(SDTransformer, ABC):
 
         pipe = self.pipeline
         batch_size = len(images)
-        representations = {}
 
         # encode image
         latents = self.encode_latents(images)  # this gives slightly different results for different batch sizes
@@ -553,19 +581,16 @@ class SD3Base(SDTransformer, ABC):
         prompt_embeds, _, pooled_prompt_embeds, _ = pipe.encode_prompt(prompt=prompts, prompt_2=None, prompt_3=None)
         latents = pipe.scheduler.scale_noise(latents, timestep=timestep.unsqueeze(0), noise=noise)
 
-        # setup hook
-        def hook_fn(_module, _input, output, pos):
-            if not raw:
-                output = output[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2).to("cpu")
-            representations[pos] = extract_fn(output)
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            'transformer_blocks.*': lambda x: x[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+        }
 
         # run pipeline
-        with ExitStack() as stack, torch.no_grad():
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.transformer(hidden_states=latents, timestep=timestep.expand(latents.shape[0]).to(device=self.device), encoder_hidden_states=prompt_embeds, pooled_projections=pooled_prompt_embeds)
 
-        return representations
+        return hooks.representations
 
 
 class SD3(SD3Base):
@@ -602,7 +627,6 @@ class FLUXBase(SDTransformer, ABC):
         pipe = self.pipeline
         batch_size = len(images)
         width, height = images[0].size
-        representations = {}
 
         # encode image
         latents = self.encode_latents(images)
@@ -638,16 +662,20 @@ class FLUXBase(SDTransformer, ABC):
         # extraction hook
         def hook_fn(_module, _input, output, pos):
             if not raw:
+                # assuming pos is `transformer_blocks[i]` or similar
                 output = output[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2).to("cpu")
             representations[pos] = extract_fn(output)
 
         # Prepare guidance if required (for FLUX.1-dev and FLUX.1-Krea)
         guidance = torch.full([latents.shape[0]], self.guidance_scale * 1000.0, device=pipe.device, dtype=latents.dtype) if pipe.transformer.config.guidance_embeds else None
 
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            'transformer_blocks.*': lambda x: x[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+        }
+
         # run pipeline
-        with ExitStack() as stack, torch.no_grad():
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.transformer(
                 hidden_states=latents,
                 timestep=timestep.expand(latents.shape[0]).to(latents.dtype)/1000,
@@ -658,7 +686,7 @@ class FLUXBase(SDTransformer, ABC):
                 img_ids=latent_image_ids
             )
 
-        return representations
+        return hooks.representations
 
 
 class FLUX1_dev(FLUXBase):
@@ -809,7 +837,6 @@ class FLUX2_dev(SDBase):
         pipe = self.pipeline
         batch_size = len(images)
         width, height = images[0].size
-        representations = {}
 
         # Encode image to latents
         latents = self.encode_latents(images)
@@ -835,16 +862,14 @@ class FLUX2_dev(SDBase):
         # Prepare guidance
         guidance = torch.full([latents.shape[0]], self.guidance_scale, device=self.device, dtype=torch.bfloat16)
 
-        # extraction hook
-        def hook_fn(_module, _input, output, pos):
-            if not raw:
-                output = output.permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2).to("cpu")
-            representations[pos] = extract_fn(output)
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            'transformer_blocks.*': lambda x: x[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2),
+            'single_transformer_blocks.*': lambda x: x.permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+        }
 
         # run pipeline
-        with ExitStack() as stack, torch.no_grad():
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.transformer(
                 hidden_states=latents,
                 timestep=(timestep / 1000).expand(latents.shape[0]).to(torch.bfloat16),
@@ -854,7 +879,7 @@ class FLUX2_dev(SDBase):
                 img_ids=img_ids,
             )
 
-        return representations
+        return hooks.representations
 
 
 class Playground_V2_5(SDUnet):
@@ -948,7 +973,6 @@ class AuraFlow(SDBase):
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> dict[str, Any]:
         pipe = self.pipeline
         batch_size = len(images)
-        representations = {}
 
         # encode image
         latents = self.encode_latents(images)
@@ -969,21 +993,15 @@ class AuraFlow(SDBase):
             do_classifier_free_guidance=False
         )
 
-        # extraction hook
-        def hook_fn(_module, _input, output, pos):
-            if not raw:
-                # cut and reshape output to spatial format
-                output = output[:,:(h_lat*w_lat//4),:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2).to("cpu")
-            representations[pos] = extract_fn(output)
+        timestep_norm = (timestep_val / 1000).expand(latents.shape[0]).to(latents.device, dtype=latents.dtype)
 
-        # Run transformer
-        timestep_norm = timestep_val / 1000
-        timestep_norm = timestep_norm.expand(latents.shape[0]).to(latents.device, dtype=latents.dtype)
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            'transformer_blocks.*': lambda x: x[:,:(h_lat*w_lat//4),:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+        }
 
-        with ExitStack() as stack, torch.no_grad():
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
-
+        # run pipeline
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.transformer(
                 latents,
                 encoder_hidden_states=prompt_embeds,
@@ -992,7 +1010,7 @@ class AuraFlow(SDBase):
                 attention_kwargs=pipe.attention_kwargs if hasattr(pipe, 'attention_kwargs') else None
             )
 
-        return representations
+        return hooks.representations
 
 
 class ZImageTurbo(SDBase):
@@ -1066,16 +1084,13 @@ class ZImageTurbo(SDBase):
 
         latent_model_input = list(latents.to(pipe.transformer.dtype).unsqueeze(2).unbind(dim=0))
 
-        representations = {}
-        def hook_fn(_module, _input, output, pos):
-            if not raw:
-                output = output[:,:image_seq_len,:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2).to("cpu")
-            representations[pos] = extract_fn(output)
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            'transformer_blocks.*': lambda x: x[:,:image_seq_len,:].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+        }
 
-        with ExitStack() as stack, torch.no_grad():
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos)))
-
+        # run pipeline
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.transformer(
                 latent_model_input,
                 timestep_model_input.to(dtype=pipe.transformer.dtype),
@@ -1083,7 +1098,7 @@ class ZImageTurbo(SDBase):
                 return_dict=False
             )
 
-        return representations
+        return hooks.representations
 
 
 class QwenImage(SDBase):
@@ -1242,22 +1257,13 @@ class QwenImage(SDBase):
         t_in = timestep.expand(batch_size).to(device=self.device, dtype=torch.long)
 
         # capture hooks
-        representations: dict[str, torch.Tensor] = {}
-        def hook_fn(_module, _inp, output, pos: str):
-            print(output)
-            print(type(output))
-            print(output[0].shape)
-            print(output[1].shape)
-            if not raw:
-                output = output[1].permute(0, 2, 1).contiguous().view(batch_size, 1, -1, h_lat // 2, w_lat // 2).to("cpu")
-            representations[pos] = extract_fn(output)
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            'transformer_blocks.*': lambda x: x[1].permute(0, 2, 1).contiguous().view(batch_size, 1, -1, h_lat // 2, w_lat // 2)
+        }
 
-        with ExitStack() as stack:
-            for pos in extract_positions:
-                stack.enter_context(
-                    _get_module_by_path(pipe.transformer, pos).register_forward_hook(partial(hook_fn, pos=pos))
-                )
-
+        # run pipeline
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks:
             pipe.transformer(
                 hidden_states=packed,
                 encoder_hidden_states=prompt_embeds,
@@ -1269,7 +1275,7 @@ class QwenImage(SDBase):
                 return_dict=False,
             )
 
-        return representations
+        return hooks.representations
 
 
 # Potential models to add:
