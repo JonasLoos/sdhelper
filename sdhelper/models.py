@@ -51,7 +51,7 @@ class _ApplyModelHooks:
         self.raw = raw
         self.transforms = transforms
         self.exit_stack = ExitStack()
-        self.hooks = []
+        self.representations: dict[str, Any] = {}
 
     def _hook_fn(self, _module, _input, output, pos: str):
         if not self.raw:
@@ -67,14 +67,14 @@ class _ApplyModelHooks:
                 output = output.to("cpu")
             elif isinstance(output, tuple):
                 output = tuple(o.to("cpu") for o in output)
-        self.hooks.append(self.extract_fn(output))
+        self.representations[pos] = self.extract_fn(output)
 
     def __enter__(self):
         self.exit_stack.__enter__()
         # register hooks for all extract positions
         for pos in self.extract_positions:
             m = _get_module_by_path(self.model, pos)
-            self.exit_stack.enter_context(m.register_forward_hook(partial(self._hook_fn, pos)))
+            self.exit_stack.enter_context(m.register_forward_hook(partial(self._hook_fn, pos=pos)))
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
