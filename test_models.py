@@ -31,7 +31,7 @@ def get_extract_position(f):
             raise ValueError(f'Unknown unet architecture: {p.unet.__class__.__name__}')
     elif hasattr(p, 'transformer'):
         if hasattr(p.transformer, 'transformer_blocks'):
-            return "transformer_blocks[12]"
+            return "transformer_blocks[6]"
         elif hasattr(p.transformer, 'single_transformer_blocks'):
             return "single_transformer_blocks[12]"
         elif hasattr(p.transformer, 'layers'):

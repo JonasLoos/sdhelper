@@ -50,14 +50,14 @@ class _ApplyModelHooks:
         self.extract_fn = extract_fn
         self.raw = raw
         self.transforms = transforms
-        self.exit_stack = contextlib.ExitStack()
+        self.exit_stack = ExitStack()
         self.hooks = []
 
     def _hook_fn(self, _module, _input, output, pos: str):
         if not self.raw:
             # apply transforms
             for mod, fn in self.transforms.items():
-                if re.match(mod[0], pos):
+                if re.fullmatch(mod, pos):
                     try:
                         output = fn(output)
                     except Exception as e:
