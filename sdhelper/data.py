@@ -4,28 +4,6 @@ from typing import Optional, Callable
 import torch
 import numpy as np
 
-@dataclass
-class SDResult:
-    prompt : str
-    seed : int
-    representations : 'SDRepresentation'
-    images : list[PILImage]
-    result_latent : torch.Tensor
-    result_tensor : torch.Tensor
-    result_image : PILImage
-    def __repr__(self): return f'SDResult(prompt="{self.prompt}",seed={self.seed},...)'
-    def to(self, device, dtype = None):
-        '''Move tensors to device and cast to dtype. Does not do a deep copy.'''
-        return SDResult(
-            prompt = self.prompt,
-            seed = self.seed,
-            representations = self.representations.to(device, dtype),
-            images = self.images,
-            result_latent = self.result_latent.to(device, dtype),
-            result_tensor = self.result_tensor.to(device, dtype),
-            result_image = self.result_image,
-        )
-
 
 class SDRepresentation():
     '''Class to store representations extracted from SD.'''
@@ -115,8 +93,8 @@ class SDRepresentation():
         i = 0
         for p in self.pos:
             r = self[p].flatten(end_dim=1)  # merge timesteps into channel dimension
-            c, w, h = r.shape
-            tmp = r.repeat_interleave(spatial[0]//w, dim=-2).repeat_interleave(spatial[1]//h, dim=-1)
+            c, h, w = r.shape
+            tmp = r.repeat_interleave(spatial[1]//h, dim=-2).repeat_interleave(spatial[0]//w, dim=-1)
             repr_full[i:i+c, :tmp.shape[-2], :tmp.shape[-1]] = tmp
             i += c
         return repr_full

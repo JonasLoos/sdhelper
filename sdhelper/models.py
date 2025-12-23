@@ -11,7 +11,7 @@ from tqdm.autonotebook import trange
 import re
 from abc import ABC, abstractmethod
 
-from .data import SDRepresentation, SDResult
+from .data import SDRepresentation
 
 
 def _get_module_by_path(model: Any, path: str) -> Any:
@@ -1031,8 +1031,8 @@ class QwenImage(SDBase):
         vae = pipe.vae
 
         # VAE
-        x = pipe.image_processor.preprocess(images).to(device=self.device, dtype=torch.float32)
-        z = vae.tiled_encode(x)
+        x = pipe.image_processor.preprocess(images).to(device=self.device, dtype=torch.float32).unsqueeze(0)
+        z = vae.tiled_encode(x).squeeze(0)
         mean, std = self._vae_stats()
         if mean is not None:
             z = (z - mean) / std
@@ -1044,7 +1044,7 @@ class QwenImage(SDBase):
         pipe = self.pipeline
         vae = pipe.vae
 
-        z = latents.to(device=self.device, dtype=torch.float32)
+        z = latents.to(device=self.device, dtype=torch.float32).unsqueeze(0)
         mean, std = self._vae_stats()
         if mean is not None:
             z = z * std + mean
@@ -1055,7 +1055,7 @@ class QwenImage(SDBase):
             out = vae.decode(z, return_dict=True)
             x = out.sample if hasattr(out, "sample") else out[0]
 
-        return pipe.image_processor.postprocess(x, output_type="pil")
+        return pipe.image_processor.postprocess(x.squeeze(0), output_type="pil")
 
     @staticmethod
     def _pack_latents_2x2(latents: torch.Tensor) -> torch.Tensor:
@@ -1125,7 +1125,7 @@ class QwenImage(SDBase):
         }
 
         # run pipeline
-        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks:
+        with _ApplyModelHooks(pipe.transformer, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.transformer(
                 hidden_states=packed,
                 encoder_hidden_states=prompt_embeds,
