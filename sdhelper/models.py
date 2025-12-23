@@ -217,9 +217,9 @@ class SDBase(ABC):
     def img2repr(self, data: PILImage | np.ndarray | str, extract_positions: list[str], step: int, prompt: str = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x, raw: bool = False) -> SDRepresentation | dict[str, Any]: ...
 
     @overload
-    def img2repr(self, data: list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x, raw: bool = False) -> list[SDRepresentation | dict[str, Any]]: ...
+    def img2repr(self, data: list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x, raw: bool = False) -> list[SDRepresentation] | list[dict[str, Any]]: ...
 
-    def img2repr(self, data: PILImage | np.ndarray | str | list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor],torch.Tensor] = lambda x: x, raw: bool = False):
+    def img2repr(self, data: PILImage | np.ndarray | str | list[PILImage | np.ndarray | str], extract_positions: list[str], step: int, prompt: str | list[str] = '', batch_size: int = 1, seed: int = 42, extract_fn: Callable[[torch.Tensor|tuple[torch.Tensor,...]],Any] = lambda x: x, raw: bool = False):
         '''Convert image to representations at specified extract positions.
 
         Args:
@@ -229,8 +229,8 @@ class SDBase(ABC):
             prompt: Prompt to use for the image. If a list is provided, each image will be paired with the corresponding prompt.
             batch_size: Number of images to process at once. The returned representations might differ slightly depending on the batch size. For best reproducability, set batch_size=1.
             seed: Seed for random number generation. If None, a random seed will be used.
-            extract_fn: Function to apply to the representations. By default, the representations are moved to the CPU.
-            raw: If True, return the raw representations without any processing like reshaping. This is applied before extract_fn.
+            extract_fn: Function to apply to the representations. Combine with `raw=True` to work on the raw representations.
+            raw: If True, return the raw representations without any further processing (e.g. reshaping).
 
         Returns:
             Dictionary with extract positions as keys and the corresponding representations as values.
@@ -247,7 +247,6 @@ class SDBase(ABC):
             datasets.load_dataset('cifar10'),
             extract_positions = ['up_blocks[1]'],
             step = 100,
-            spatial_avg = True,
         )
         repr_dataset.save_to_disk('SD15_cifar10_up1_representations')
         ```
@@ -264,15 +263,18 @@ class SDBase(ABC):
         if not all(isinstance(p, str) for p in prompt): raise ValueError('Prompts must be strings')
         if not all(img.size == images_rgb[0].size for img in images_rgb) and batch_size != 1: raise ValueError('All images must have the same size when batch_size != 1')
 
-        # extract representations
+        # extract representations in batches
         representations = []
         for i in trange(0, len(images_rgb), batch_size, desc='Extracting representations for list of images', disable=single or self.disable_progress_bar):
             torch.manual_seed(seed)
             r = self._img2repr(images_rgb[i:i+batch_size], extract_positions, step, prompt[i:i+batch_size], seed, extract_fn, raw)
+            # if raw=True, return the raw dict, otherwise convert to SDRepresentation
             if raw:
                 representations.append(r)
-            for i in range(batch_size):
-                representations.append(SDRepresentation({p: tuple(x[i] for x in r[p]) if isinstance(r[p], tuple) else r[p][i] for p in extract_positions}, seed))
+            else:
+                # split up the batch and convert to SDRepresentation objects
+                for j in range(batch_size):
+                    representations.append(SDRepresentation({p: tuple(x[j] for x in r[p]) if isinstance(r[p], tuple) else r[p][j] for p in extract_positions}, seed))
         return representations[0] if single else representations
 
 
@@ -663,13 +665,6 @@ class FLUXBase(SDTransformer, ABC):
         generator = torch.Generator(device=pipe.device).manual_seed(seed)
         latents, latent_image_ids = pipe.prepare_latents(batch_size, pipe.transformer.config.in_channels // 4, width, height, prompt_embeds.dtype, pipe.device, generator=generator, latents=latents)
         latents = pipe._pack_latents(latents, *latents.shape)
-
-        # extraction hook
-        def hook_fn(_module, _input, output, pos):
-            if not raw:
-                # assuming pos is `transformer_blocks[i]` or similar
-                output = output[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2).to("cpu")
-            representations[pos] = extract_fn(output)
 
         # Prepare guidance if required (for FLUX.1-dev and FLUX.1-Krea)
         guidance = torch.full([latents.shape[0]], self.guidance_scale * 1000.0, device=pipe.device, dtype=latents.dtype) if pipe.transformer.config.guidance_embeds else None
