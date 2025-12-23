@@ -145,26 +145,11 @@ class SDBase(ABC):
         self._representation_shapes = None
         self._cached_prompt_embeds = {}
 
-    def __call__(self, prompt: str, steps: Optional[int] = None, guidance_scale: Optional[float] = None, seed: Optional[int] = None, *, width: Optional[int] = None, height: Optional[int] = None, modification: Optional[Callable[[Any,Any,Any,str],Optional[torch.Tensor]]] = None, extract_positions: list[str] = []) -> 'SDResult':
+    def __call__(self, prompt: str, steps: Optional[int] = None, guidance_scale: Optional[float] = None, seed: Optional[int] = None, *, width: Optional[int] = None, height: Optional[int] = None, **pipeline_kwargs) -> PILImage:
         if steps is None: steps = self.steps
         if guidance_scale is None: guidance_scale = self.guidance_scale
         if seed is None: seed = int(torch.randint(0, 2**32, (1,)).item())
-        return self._generate(prompt, steps, guidance_scale, seed, width=width, height=height, modification=modification, extract_positions=extract_positions)
-
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
-        if modification is not None or len(extract_positions) > 0:
-            raise ValueError(f'{self.name} support for modifications, or extract positions is not implemented yet.')
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        result_images = self.pipeline(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height, generator=generator)
-        return SDResult(
-            prompt=prompt,
-            seed=seed,
-            representations=None,
-            images=None,
-            result_latent=None,
-            result_tensor=None,
-            result_image=result_images.images[0],
-        )
+        return self.pipeline(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height, generator=torch.Generator(device=self.device).manual_seed(seed), **pipeline_kwargs).images[0]
 
     def quantize(self, quantization_modules: list[str] | None = None, quantization_type: str = 'qfloat8', model_cpu_offload: bool = False, sequential_cpu_offload: bool = False):
         '''Optimize VRAM usage of the model.
@@ -296,61 +281,6 @@ class SDUnet(SDBase, ABC):
             latents: The latents to decode.
         '''
         return self.pipeline.numpy_to_pil(self.vae_decode(latents).clamp(0, 1).cpu().permute(0, 2, 3, 1).numpy())
-
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification: Optional[Callable[[Any,Any,Any,str],Optional[torch.Tensor]]] = None, extract_positions: list[str] = []) -> 'SDResult':
-
-        # variables to store extracted results in
-        representations = {pos: [] for pos in extract_positions}
-        images = []
-
-        def latents_callback(pipe, step_index, timestep, callback_kwargs):
-            '''callback function to extract intermediate images'''
-            latents = callback_kwargs['latents']
-            image = (self.vae_decode(latents)[0] / 2 + 0.5).clamp(0, 1).cpu().permute(1, 2, 0).numpy()
-            images.extend(self.pipeline.numpy_to_pil(image))
-            return callback_kwargs
-
-        # extraction hook
-        def hook_fn(_module, _input, output, pos):
-            if isinstance(output, tuple):
-                output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
-            representations[pos].append(output)
-            if modification:
-                return modification(_module, _input, output, pos)
-
-        # run pipeline
-        with ExitStack() as stack, torch.no_grad():
-            # setup hooks to extract representations
-            for pos in extract_positions:
-                stack.enter_context(_get_module_by_path(self.pipeline.unet, pos).register_forward_hook(partial(hook_fn, pos=pos)))
-
-            # run pipeline
-            result = self.pipeline(
-                prompt,
-                width = width,
-                height = height,
-                num_inference_steps = steps,
-                guidance_scale = guidance_scale,
-                callback_on_step_end = latents_callback,
-                callback_on_step_end_tensor_inputs = ['latents'],
-                generator = torch.Generator(self.device).manual_seed(seed),
-                output_type = 'latent',
-            )
-
-        # cast images to same dtype as vae
-        result_tensor = self.vae_decode(result.images)
-        result_image = self.pipeline.image_processor.postprocess(result_tensor.detach(), output_type='pil')
-
-        # return results
-        return SDResult(
-            prompt=prompt,
-            seed=seed,
-            representations=SDRepresentation(representations, seed),
-            images=images,
-            result_latent=result.images[0],
-            result_tensor=result_tensor[0],
-            result_image=result_image[0],
-        )
 
     @torch.no_grad()
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool = False) -> dict[str, Any]:
@@ -671,7 +601,7 @@ class FLUXBase(SDTransformer, ABC):
 
         # transforms applied during representation extraction to improve the format of the extracted features
         transforms = {
-            'transformer_blocks.*': lambda x: x[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
+            '(single_)?transformer_blocks.*': lambda x: x[1].permute(0, 2, 1).reshape(batch_size, 1, -1, h_lat//2, w_lat//2)
         }
 
         # run pipeline
@@ -808,9 +738,6 @@ class FLUX2_dev(SDBase):
         # Postprocess to PIL images
         return self.pipeline.image_processor.postprocess(image, output_type="pil")
 
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
-        raise NotImplementedError("Flux.2-dev currently does not support image generation, as the text encoder is not automatically loaded. You can use `FLUX2_dev().pipeline(...)` instead.")
-
     @staticmethod
     def _compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
         """Compute mu for dynamic shifting scheduler (from Flux2Pipeline)."""
@@ -900,26 +827,6 @@ class Playground_V2_5(SDUnet):
             local_files_only=self.local_files_only,
         ).to(self.device)
 
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
-        # The standard unet `_generate` method leads to grayish images, so we just use the pipeline directly.
-        result = self.pipeline(
-            prompt=prompt,
-            num_inference_steps=steps,
-            guidance_scale=guidance_scale,
-            width=width,
-            height=height,
-            generator=torch.Generator(device=self.device).manual_seed(seed),
-            output_type="pil",
-        )
-        return SDResult(
-            prompt=prompt,
-            seed=seed,
-            representations=None,
-            images=None,
-            result_latent=None,
-            result_tensor=None,
-            result_image=result.images[0],
-        )
 
 class AuraFlow(SDBase):
     """AuraFlow v0.3 is a large rectified flow T2I model with a dedicated AuraFlowPipeline."""
@@ -954,21 +861,6 @@ class AuraFlow(SDBase):
         latents = latents / vae.config.scaling_factor
         image = vae.decode(latents.to(dtype=torch.float32), return_dict=False)[0]
         return self.pipeline.image_processor.postprocess(image, output_type="pil")
-
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *, width: Optional[int] = None, height: Optional[int] = None, modification = None, extract_positions: list[str] = []) -> 'SDResult':
-        pipe = self.pipeline
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        latents = pipe(prompt, num_inference_steps=steps, guidance_scale=guidance_scale, width=width, height=height, generator=generator, output_type="latent").images
-        image = self.decode_latents(latents)[0]
-        return SDResult(
-            prompt=prompt,
-            seed=seed,
-            representations=None,
-            images=None,
-            result_latent=latents,
-            result_tensor=None,
-            result_image=image,
-        )
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int, prompts: list[str], seed: int, extract_fn: Callable[[torch.Tensor],torch.Tensor], raw: bool) -> dict[str, Any]:
         pipe = self.pipeline
@@ -1184,36 +1076,6 @@ class QwenImage(SDBase):
         lat = lat.permute(0, 3, 1, 4, 2, 5).contiguous()
         lat = lat.view(b, c, h_lat, w_lat)
         return lat
-
-    def _generate(self, prompt: str, steps: int, guidance_scale: float, seed: int, *,
-                  width: Optional[int] = None, height: Optional[int] = None,
-                  modification=None, extract_positions: list[str] = []) -> "SDResult":
-        if modification is not None or extract_positions:
-            raise ValueError("QwenImage: modifications/extract_positions during generation not implemented.")
-
-        pipe = self.pipeline
-        g = torch.Generator(device=self.device).manual_seed(seed)
-
-        out = pipe(
-            prompt=prompt,
-            negative_prompt="",
-            true_cfg_scale=guidance_scale,
-            num_inference_steps=int(steps),
-            width=width,
-            height=height,
-            generator=g,
-            output_type="pil",
-        )
-
-        return SDResult(
-            prompt=prompt,
-            seed=seed,
-            representations=None,
-            images=None,
-            result_latent=None,
-            result_tensor=None,
-            result_image=out.images[0],
-        )
 
     def _img2repr(self, images: list[PILImage], extract_positions: list[str], step: int,
                   prompts: list[str], seed: int,
