@@ -314,7 +314,7 @@ class SDUnet(SDBase, ABC):
                 output = output[0]  # TODO: is it good to always take the first output and ignore the rest?
             representations[pos].append(output)
             if modification:
-                return modification(module, input, output, pos)
+                return modification(_module, _input, output, pos)
 
         # run pipeline
         with ExitStack() as stack, torch.no_grad():
@@ -373,8 +373,13 @@ class SDUnet(SDBase, ABC):
         # setup unet config
         pipe.unet.config.addition_embed_type = 'nothing_at_all'
 
+        # transforms applied during representation extraction to improve the format of the extracted features
+        transforms = {
+            '.*': lambda x: x.unsqueeze(1),
+        }
+
         # run pipeline
-        with _ApplyModelHooks(pipe.unet, extract_positions, extract_fn, raw) as hooks, torch.no_grad():
+        with _ApplyModelHooks(pipe.unet, extract_positions, extract_fn, raw, transforms) as hooks, torch.no_grad():
             pipe.unet(latents, timestep, encoder_hidden_states=prompt_embeds)
 
         return hooks.representations
