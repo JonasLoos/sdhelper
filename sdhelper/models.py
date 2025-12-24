@@ -597,7 +597,7 @@ class FLUXBase(SDTransformer, ABC):
         latents = pipe._pack_latents(latents, *latents.shape)
 
         # Prepare guidance if required (for FLUX.1-dev and FLUX.1-Krea)
-        guidance = torch.full([latents.shape[0]], self.guidance_scale * 1000.0, device=pipe.device, dtype=latents.dtype) if pipe.transformer.config.guidance_embeds else None
+        guidance = torch.full([latents.shape[0]], self.guidance_scale, device=pipe.device, dtype=latents.dtype) if pipe.transformer.config.guidance_embeds else None
 
         # transforms applied during representation extraction to improve the format of the extracted features
         transforms = {

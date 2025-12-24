@@ -1,2 +1,2 @@
 from .models import SD
-from .data import SDRepresentation, SDResult
+from .data import SDRepresentation
