@@ -55,6 +55,7 @@ class _ApplyModelHooks:
 
     def _hook_fn(self, _module, _input, output, pos: str):
         if not self.raw:
+            err = False
             # apply transforms
             for mod, fn in self.transforms.items():
                 if re.fullmatch(mod, pos):
@@ -62,11 +63,15 @@ class _ApplyModelHooks:
                         output = fn(output)
                     except Exception as e:
                         print(f"Error applying transform to {pos}: {e}")
+                        err = True
             # try to move to cpu
-            if isinstance(output, torch.Tensor):
+            try:
                 output = output.to("cpu")
-            elif isinstance(output, tuple):
-                output = tuple(o.to("cpu") for o in output)
+            except Exception as e:
+                print(f'Failed to move tensor to cpu: {e}')
+                err = True
+            if err:
+                print(f'You may want to use `raw=True` and potentially set an `extract_fn` for representation extraction at `{pos}` on {_module}')
         self.representations[pos] = self.extract_fn(output)
 
     def __enter__(self):
@@ -307,7 +312,7 @@ class SDUnet(SDBase, ABC):
 
         # transforms applied during representation extraction to improve the format of the extracted features
         transforms = {
-            '.*': lambda x: x.unsqueeze(1),
+            '.*': lambda x: (x[0] if isinstance(x, tuple) else x).unsqueeze(1),
         }
 
         # run pipeline
